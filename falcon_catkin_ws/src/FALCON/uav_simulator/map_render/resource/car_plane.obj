@@ -1,0 +1,15 @@
+
+mtllib car_plane.mtl
+o CarPlane
+v 0 -1.0 0
+v 0 1.0 0
+v 0 1.0 1.5
+v 0 -1.0 1.5
+vt 1.0 0.0
+vt 0.0 0.0
+vt 0.0 1.0
+vt 1.0 1.0
+vn 1.0000 0.0000 0.0000
+usemtl car_material
+s off
+f 1/1/1 2/2/1 3/3/1 4/4/1

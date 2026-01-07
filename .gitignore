@@ -1,0 +1,22 @@
+# ROS/catkin
+build/
+devel/
+install/
+logs/
+.ros/
+*.bag
+*.bag.active
+*.bag.orig
+# runtime IPC / outputs
+shared/
+*.jpg
+*.png
+*.json
+
+# python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

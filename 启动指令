@@ -1,0 +1,41 @@
+roslaunch exploration_manager exploration.launch map_name:="map_with_car_1"
+roslaunch exploration_manager rviz.launch
+rosrun perception_bridge json_publisher.py _infer_path:=/shared/infer.json _score_thresh:=0.35 _k_confirm:=3 _k_lost:=5
+rosrun perception_bridge prompt_writer.py _out_path:=/shared/prompt.txt
+rosrun mission_fsm mission_fsm.py _watch_dir:=/shared/tracking_results
+rosrun perception_bridge frame_dumper.py _imagtopic:=/camera/image_raw _rate_hz:=2.0 _out_dir:=/shared
+rostopic pub -1 /mission/text_goal std_msgs/String "data: 'car'"
+rosrun rgb_render rgb_render_node _voxel_size:=0.005
+python infer_loop.py   --input_image /home/young/uav_demo/shared/frame.jpg   --prompt "car."   --out_dir /home/young/uav_demo/shared/tracking_results   --work_dir /tmp/sam2_window   --window_size 12   --infer_hz 2   --box_threshold 0.25   --text_threshold 0.30   --score_thresh_for_found 0.25
+rosrun perception_bridge pose_follower.py _model_name:=gz_uav
+export http_proxy="http://172.17.0.1:7897" && export https_proxy="http://172.17.0.1:7897"
+
+最新版：roslaunch gazebo_ros empty_world.launch   use_sim_time:=false   world_name:=/root/catkin_ws/src/gazebo/worlds/complex_office.world
+rosrun perception_bridge pose_follower.py _model_name:=gz_uav
+python infer_loop.py
+rosrun perception_bridge frame_dumpery _imagtopic:=/camera/image_raw _rate_hz:=2.0 _out_dir:=/shared
+rosrun perception_bridge prompt_writer.py _out_path:=/shared/prompt.txt
+rosrun perception_bridge json_publisher.py _infer_path:=/shared/infer.json _score_thresh:=0.35 _k_confirm:=2 _k_lost:=5
+rosrun mission_fsm mission_fsm.py _watch_dir:=/shared/tracking_results
+rostopic pub -1 /mission/text_goal std_msgs/String "data: 'car'"
+rosrun lang_explore cue_bias_node.py \
+  _infer_cue_json:=/shared/infer_cue.json \
+  _odom_topic:=/uav_simulator/odometry \
+  _hfov_deg:=90.0 \
+  _score_th:=0.5 \
+  _bins:=36 \
+  _decay:=0.98
+rosrun lang_explore frontier_reranker.py \
+  _frontier_pcl:=/planning_vis/frontier_pcl \
+  _odom_topic:=/uav_simulator/odometry \
+  _hist_topic:=/lang/cue_hist \
+  _goal_topic:=/move_base_simple/goal \
+  _beta_lang:=8.0 \
+  _alpha_dist:=1.0 \
+  _energy_th:=1.0 \
+  _sample_n:=800 \
+  _pub_rate:=1.0 \
+  _min_hold_s:=3.0 \
+  _min_goal_shift_m:=1.5
+
+

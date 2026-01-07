@@ -1,0 +1,4 @@
+Log file created at: 2025/12/22 22:43:54
+Running on machine: young
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+I1222 22:43:54.645081 58371 exploration_node.cpp:24] Exploration task start at 1766461434.645100255

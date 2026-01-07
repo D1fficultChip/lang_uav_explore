@@ -1,0 +1,4 @@
+Log file created at: 2025/12/25 01:14:13
+Running on machine: young
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+F1225 01:14:13.040480 18145 exploration_manager.cpp:578] Check failed: sop_time <= 1.0 (1.01932 vs. 1) SOP solver internal error detected, solver blocked with unknown error. Please restart the planner

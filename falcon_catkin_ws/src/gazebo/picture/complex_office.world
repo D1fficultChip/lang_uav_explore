@@ -1,0 +1,44 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="default">
+
+    <!-- 光照 -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- 地面（可选，但建议有，方便定位） -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- 你的迷宫墙体 mesh 地图 -->
+    <model name="complex_office_map">
+      <static>true</static>
+      <pose>15.5 15.5 -0.5  1.5708 0 -1.5708</pose>
+      <link name="map_link">
+        <visual name="map_visual">
+          <geometry>
+            <mesh>
+              <uri>file:///root/catkin_ws/src/FALCON/uav_simulator/map_render/resource/complex_office.dae</uri>
+            <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+    
+    <include>
+    <uri>model:///root/catkin_ws/src/gazebo</uri>
+    <name>gz_uav</name>
+    <pose>-6 0 1 0 0 0</pose>
+    </include>
+
+    <include>
+    <uri>model://poster_plane</uri>
+    <name>poster1</name>
+    <pose>5 7 1 0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>

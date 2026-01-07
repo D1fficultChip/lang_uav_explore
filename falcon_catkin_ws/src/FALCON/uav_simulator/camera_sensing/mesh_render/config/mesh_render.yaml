@@ -1,0 +1,7 @@
+mesh_render:
+  open3d_resource_path: "/usr/local/share/Open3D/resources"
+  enable_depth: true
+  enable_color: true
+  render_rate: 15
+  verbose: false
+  

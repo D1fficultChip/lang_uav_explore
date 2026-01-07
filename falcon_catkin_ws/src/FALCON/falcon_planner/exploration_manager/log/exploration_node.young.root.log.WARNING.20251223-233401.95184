@@ -1,0 +1,35 @@
+Log file created at: 2025/12/23 23:34:01
+Running on machine: young
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+W1223 23:34:01.531627 95184 exploration_fsm.cpp:94] [FSM] Receive odom from topic /uav_simulator/odometry
+W1223 23:34:01.531853 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.531856409 Transit state from INIT to WAIT_TRIGGER by FSM
+W1223 23:34:01.563410 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.563416650 Transit state from WAIT_TRIGGER to PLAN_TRAJ by frontierCallback
+W1223 23:34:01.613775 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.613778056 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:01.664115 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.664118186 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:01.894871 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.894873090 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:01.936971 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550841.936975592 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:02.039983 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.039985191 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:02.215399 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.215400272 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:02.272323 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.272327317 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:02.273452 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.273454869 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:02.540580 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.540582393 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:02.603363 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.603366843 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:02.645431 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.645433482 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:02.866560 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.866563066 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:02.934656 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550842.934660811 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:03.069270 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.069272816 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:03.189793 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.189796149 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:03.254657 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.254661904 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:03.294973 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.294977710 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:03.563090 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.563092325 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:03.622956 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.622960215 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:03.673285 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.673286453 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:03.880692 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.880695535 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:03.940805 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550843.940810062 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:04.050661 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.050663563 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:04.217834 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.217838164 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:04.288607 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.288609396 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:04.318898 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.318900169 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W1223 23:34:04.560009 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.560010633 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W1223 23:34:04.629768 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.629773392 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W1223 23:34:04.670152 95184 exploration_fsm.cpp:917] [FSM] ROS Time: 1766550844.670154875 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM

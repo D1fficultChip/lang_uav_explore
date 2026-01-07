@@ -1,0 +1,19 @@
+material Poster/Poster
+{
+  technique
+  {
+    pass
+    {
+      ambient 1 1 1 1
+      diffuse 1 1 1 1
+      emissive 0.3 0.3 0.3 1
+      cull_hardware none
+      cull_software none
+      texture_unit
+      {
+        texture 00050.jpg
+        filtering bilinear
+      }
+    }
+  }
+}

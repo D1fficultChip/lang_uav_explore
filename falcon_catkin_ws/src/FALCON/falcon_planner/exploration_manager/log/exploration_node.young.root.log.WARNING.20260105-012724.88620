@@ -1,0 +1,31 @@
+Log file created at: 2026/01/05 01:27:24
+Running on machine: young
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+W0105 01:27:24.817975 88620 exploration_fsm.cpp:94] [FSM] Receive odom from topic /uav_simulator/odometry
+W0105 01:27:24.818347 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594444.818353762 Transit state from INIT to WAIT_TRIGGER by FSM
+W0105 01:27:24.911301 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594444.911311286 Transit state from WAIT_TRIGGER to PLAN_TRAJ by frontierCallback
+W0105 01:27:24.968776 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594444.968783631 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:25.021399 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.021405811 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:25.386708 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.386714082 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:25.434303 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.434308843 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:25.494925 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.494929595 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:25.854526 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.854529824 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:25.926328 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.926368882 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:25.929242 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594445.929245244 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:26.231457 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.231460909 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:26.461361 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.461369286 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:26.463423 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.463428729 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:26.729738 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.729741207 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:26.912950 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.912952988 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:26.963498 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594446.963502927 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:27.225525 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.225528167 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:27.448262 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.448270169 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:27.478857 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.478861746 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:27.737721 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.737726755 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:27.955271 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.955330784 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:27.986179 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594447.986182600 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:28.338814 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594448.338819139 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+W0105 01:27:28.420145 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594448.420152082 Transit state from PLAN_TRAJ to PUB_TRAJ by FSM
+W0105 01:27:28.450682 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594448.450685583 Transit state from PUB_TRAJ to EXEC_TRAJ by FSM
+W0105 01:27:28.939059 88620 exploration_fsm.cpp:917] [FSM] ROS Time: 1767594448.939064910 Transit state from EXEC_TRAJ to PLAN_TRAJ by FSM
+F0105 01:27:30.194399 88620 exploration_manager.cpp:578] Check failed: sop_time <= 1.0 (1.02598 vs. 1) SOP solver internal error detected, solver blocked with unknown error. Please restart the planner

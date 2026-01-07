@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="falcon_camera_rig">
+    <!-- 别设 static=true；static 模型有时不会被 set_model_state 正确更新 -->
+    <static>false</static>
+
+    <link name="camera">
+      <!-- 禁重力，避免掉下去 -->
+      <gravity>false</gravity>
+
+      <sensor name="rgb_cam" type="camera">
+        <always_on>true</always_on>
+        <update_rate>10</update_rate>
+        <camera>
+          <horizontal_fov>1.570796</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>50</far>
+          </clip>
+        </camera>
+
+        <!-- gazebo_ros_camera 插件会发布 sensor_msgs/Image 与 CameraInfo -->
+        <plugin name="gazebo_ros_camera" filename="libgazebo_ros_camera.so">
+          <robotNamespace>/gazebo_cam</robotNamespace>
+          <cameraName>rgb</cameraName>
+          <imageTopicName>image_raw</imageTopicName>
+          <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <frameName>camera</frameName>
+        </plugin>
+      </sensor>
+    </link>
+  </model>
+</sdf>
