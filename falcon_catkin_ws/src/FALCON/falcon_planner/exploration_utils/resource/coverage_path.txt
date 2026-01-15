@@ -1,47 +1,48 @@
-NAME : coverage_path.65533.tour
-COMMENT : Length = 65533
-COMMENT : Found by LKH [Keld Helsgaun] Wed Jan  7 07:29:11 2026
+NAME : coverage_path.71048.tour
+COMMENT : Length = 71048
+COMMENT : Found by LKH [Keld Helsgaun] Thu Jan 15 02:43:52 2026
 TYPE : TOUR
-DIMENSION : 39
+DIMENSION : 40
 TOUR_SECTION
 1
-15
-16
-9
-7
-6
-8
-5
-4
-12
-14
-21
-13
-20
-19
 18
-11
-3
-2
-10
+16
 17
-25
-26
+15
+14
+8
+2
+3
+9
+10
+4
+5
+11
+19
+20
+12
+6
+7
+13
+21
 28
 27
+25
+26
 32
+33
+34
+40
+39
+38
+37
 31
 30
-34
-35
 36
-37
-38
-39
-33
+35
 29
+22
 23
 24
-22
 -1
 EOF

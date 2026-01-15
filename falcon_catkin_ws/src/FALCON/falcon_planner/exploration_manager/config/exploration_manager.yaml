@@ -20,9 +20,9 @@ exploration_manager:
 
   lang:
     enable: true
-    beta: 10.0
+    beta: 6.0
     timeout: 0.8
     conf_min: 0.2
-    smooth_win: 1
+    smooth_win: 2
     debug: true
   

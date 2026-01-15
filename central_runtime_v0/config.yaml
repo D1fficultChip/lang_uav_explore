@@ -1,0 +1,13 @@
+shared_dir: /home/young/uav_demo/shared  # 主机shared真实路径
+infer_json: infer.json
+prompt_txt: prompt.txt
+
+adapters:
+  SEARCH:
+    container: falcon_noetic
+    cmd: ["bash","-lc",
+          "source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash && roslaunch exploration_manager exploration.launch map_name:=complex_office"]
+    pidfile: "/shared/falcon_search.pid"
+    logfile: "/shared/falcon_search.log"
+    stop_pattern: "roslaunch exploration_manager exploration.launch"
+  

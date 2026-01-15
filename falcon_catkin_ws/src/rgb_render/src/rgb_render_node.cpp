@@ -48,7 +48,7 @@ public:
       ROS_INFO("[rgb_render] Map loaded. cloud points=%zu (after downsample=%zu)",
                cloud_raw_->points.size(), cloud_ds_->points.size());
     }
-  }
+  }voxel_size
 
 private:
   bool loadMapFromParams() {

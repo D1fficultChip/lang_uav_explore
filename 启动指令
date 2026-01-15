@@ -13,7 +13,7 @@ export http_proxy="http://172.17.0.1:7897" && export https_proxy="http://172.17.
 最新版：roslaunch gazebo_ros empty_world.launch   use_sim_time:=false   world_name:=/root/catkin_ws/src/gazebo/worlds/complex_office.world
 rosrun perception_bridge pose_follower.py _model_name:=gz_uav
 python infer_loop.py
-rosrun perception_bridge frame_dumpery _imagtopic:=/camera/image_raw _rate_hz:=2.0 _out_dir:=/shared
+rosrun perception_bridge frame_dumper.py _imagtopic:=/camera/image_raw _rate_hz:=2.0 _out_dir:=/shared
 rosrun perception_bridge prompt_writer.py _out_path:=/shared/prompt.txt
 rosrun perception_bridge json_publisher.py _infer_path:=/shared/infer.json _score_thresh:=0.35 _k_confirm:=2 _k_lost:=5
 rosrun mission_fsm mission_fsm.py _watch_dir:=/shared/tracking_results
@@ -38,4 +38,9 @@ rosrun lang_explore frontier_reranker.py \
   _min_hold_s:=3.0 \
   _min_goal_shift_m:=1.5
 
+export http_proxy="http://172.17.0.1:7897"export https_proxy="http://172.17.0.1:7897"
+xhost +local:root
+export DEEPSEEK_API_KEY=sk-288731639e2c41fd990c9c9371f6eb3a
 
+python3 /home/young/uav_demo/task_compiler_v0.py task
+python3 run_plan.py --plan /home/young/uav_demo/shared/plan.json --config config.yaml

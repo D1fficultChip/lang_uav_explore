@@ -9,7 +9,7 @@ class FrameDumper:
     def __init__(self):
         self.image_topic = rospy.get_param("~image_topic", "/camera/image_raw")
         self.out_dir = rospy.get_param("~out_dir", "/shared")
-        self.rate_hz = float(rospy.get_param("~rate_hz", 2.0))
+        self.rate_hz = float(rospy.get_param("~rate_hz", 5.0))
         self.jpeg_quality = int(rospy.get_param("~jpeg_quality", 90))
 
         self.bridge = CvBridge()
