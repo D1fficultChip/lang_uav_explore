@@ -11,7 +11,7 @@ material Poster/Poster1
       cull_software none
       texture_unit
       {
-        texture exit1.png
+        texture parking.png
         filtering bilinear
       }
     }

@@ -12,12 +12,9 @@ export http_proxy="http://172.17.0.1:7897" && export https_proxy="http://172.17.
 
 最新版：roslaunch gazebo_ros empty_world.launch   use_sim_time:=false   world_name:=/root/catkin_ws/src/gazebo/worlds/complex_office.world
 rosrun perception_bridge pose_follower.py _model_name:=gz_uav
-python infer_loop.py
+python infer_loop_vis_guide.py
 rosrun perception_bridge frame_dumper.py _imagtopic:=/camera/image_raw _rate_hz:=2.0 _out_dir:=/shared
-rosrun perception_bridge prompt_writer.py _out_path:=/shared/prompt.txt
 rosrun perception_bridge json_publisher.py _infer_path:=/shared/infer.json _score_thresh:=0.35 _k_confirm:=2 _k_lost:=5
-rosrun mission_fsm mission_fsm.py _watch_dir:=/shared/tracking_results
-rostopic pub -1 /mission/text_goal std_msgs/String "data: 'car'"
 rosrun lang_explore cue_bias_node.py \
   _infer_cue_json:=/shared/infer_cue.json \
   _odom_topic:=/uav_simulator/odometry \
@@ -25,22 +22,42 @@ rosrun lang_explore cue_bias_node.py \
   _score_th:=0.5 \
   _bins:=36 \
   _decay:=0.98
-rosrun lang_explore frontier_reranker.py \
-  _frontier_pcl:=/planning_vis/frontier_pcl \
-  _odom_topic:=/uav_simulator/odometry \
-  _hist_topic:=/lang/cue_hist \
-  _goal_topic:=/move_base_simple/goal \
-  _beta_lang:=8.0 \
-  _alpha_dist:=1.0 \
-  _energy_th:=1.0 \
-  _sample_n:=800 \
-  _pub_rate:=1.0 \
-  _min_hold_s:=3.0 \
-  _min_goal_shift_m:=1.5
-
+python3 run_plan.py --plan /home/young/uav_demo/shared/plan.json --config config.yaml
 export http_proxy="http://172.17.0.1:7897"export https_proxy="http://172.17.0.1:7897"
 xhost +local:root
 export DEEPSEEK_API_KEY=sk-288731639e2c41fd990c9c9371f6eb3a
 
 python3 /home/young/uav_demo/task_compiler_v0.py task
+
+python3 -m http.server 8000
+xhost +local:root
+rosrun topic_tools mux /planning/pos_cmd /falcon/pos_cmd /ego/pos_cmd __name:=cmd_mux
+rosrun perception_bridge hold_publisher.py _odom_topic:=/uav_simulator/odometry _out_topic:=/hold/pos_cmd _rate:=30
 python3 run_plan.py --plan /home/young/uav_demo/shared/plan.json --config config.yaml
+HOST_IP=$(ip route get 8.8.8.8 | awk '{print $7; exit}')
+
+docker run --rm -it --net=host \
+  -e ROS_MASTER_URI=http://127.0.0.1:11311 \
+  -e ROS_IP=$HOST_IP \
+  -v /home/young/uav_demo:/home/young/uav_demo \
+  -v /home/young/uav_demo/shared:/shared \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  runtime_noetic:latest bash
+
+# rosrun perception_bridge prompt_writer.py _out_path:=/shared/prompt.txt
+
+# rosrun mission_fsm mission_fsm.py _watch_dir:=/shared/tracking_results
+# rostopic pub -1 /mission/text_goal std_msgs/String "data: 'car'"
+
+# rosrun lang_explore frontier_reranker.py \
+#   _frontier_pcl:=/planning_vis/frontier_pcl \
+#   _odom_topic:=/uav_simulator/odometry \
+#   _hist_topic:=/lang/cue_hist \
+#   _goal_topic:=/move_base_simple/goal \
+#   _beta_lang:=8.0 \
+#   _alpha_dist:=1.0 \
+#   _energy_th:=1.0 \
+#   _sample_n:=800 \
+#   _pub_rate:=1.0 \
+#   _min_hold_s:=3.0 \
+#   _min_goal_shift_m:=1.5

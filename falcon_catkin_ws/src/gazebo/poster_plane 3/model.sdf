@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="poster_plane 3">
+    <static>true</static>
+
+    <link name="poster_link">
+      <!-- 视觉：一个很薄的盒子，避免与墙面z-fighting -->
+      <visual name="poster_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <!-- 海报尺寸：先设 1.0m x 0.7m（你可后面改） -->
+          <box><size>0.01 1.0 3</size></box>
+        </geometry>
+
+        <material>
+          <script>
+            <uri>file:///root/catkin_ws/src/gazebo/poster_plane 3/materials/scripts</uri>
+            <uri>file:///root/catkin_ws/src/gazebo/poster_plane 3/materials/textures</uri>
+            <name>Poster/Poster4</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

@@ -16,17 +16,18 @@
   <rosparam command="load" file="$(find exploration_preprocessing)/config/hgrid.yaml"/>
   <rosparam command="load" file="$(find exploration_utils)/config/perception_utils.yaml"/>
   <rosparam command="load" file="$(find exploration_manager)/config/exploration_manager.yaml"/>
-
+  
   <!-- Launch exploration node -->
-  <node pkg="exploration_manager" name="exploration_node" type="exploration_node" output="screen" 
-      launch-prefix="gdb -ex run --args">
+  <node pkg="exploration_manager" name="exploration_node" type="exploration_node" output="screen" >
     <remap from ="/odom_world" to="$(arg odometry_topic)"/>
     <remap from ="/voxel_mapping/depth_image" to = "$(arg depth_image)"/>
     <remap from ="/transformer/sensor_pose_topic"   to = "$(arg sensor_pose_topic)"/>
   </node>
 
   <!-- Launch trajectory server -->
-  <node pkg="fast_planner" name="traj_server" type="traj_server" output="screen" />
+  <node pkg="fast_planner" name="traj_server" type="traj_server" output="screen" >
+      <remap from="/planning/pos_cmd" to="/falcon/pos_cmd"/>
+  </node>
 
   <!-- Launch UAV Simulator if needed -->
   <group if="$(eval 'true' if arg('mode')=='uav_simulator' else 'false')">

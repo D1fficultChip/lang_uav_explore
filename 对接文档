@@ -1,0 +1,584 @@
+
+# 语言驱动无人机任务执行框架 项目总览文档（工程对接版）
+
+## 0. 项目一句话目标
+
+让用户输入自然语言任务（短任务/长任务），系统在陌生环境中自主探索、语义感知、阶段切换并执行：
+**自然语言 → 云端 LLM 编译成 plan.json（一次调用） → 机载/本地中枢按计划驱动执行层（FALCON/EGO 等） + 多模态感知（GSAM2）闭环运行**。
+
+---
+
+## 1. 发展历史与关键里程碑（从最原始开发开始）
+
+### 1.1 Baseline（仅传统执行层）
+
+* 执行层：FALCON（ROS1 Noetic）在仿真环境（Gazebo）中自主探索，输出运动指令到控制接口话题（`/planning/pos_cmd`）。
+
+### 1.2 M1：加入“共享目录 IPC”的多模态闭环（稳定运行）
+
+目标：不在推理容器里装 ROS，通过 `/shared` 做跨进程通信，实现闭环：
+**探索运动 → 相机帧落盘 → GSAM2 检测分割 → 结果落盘 → ROS 端滤波发布 `/perception/target_found` → FSM 切状态**。
+
+关键点：
+
+* 采用**文件总线**（frame.jpg / prompt.txt / infer.json）让 ROS 与推理解耦。
+* 推理端输出可视化 `infer_vis.jpg` 便于调试。
+
+### 1.3 M3-lite：加入“语义线索 cue → cue_hist”影响探索（跑通）
+
+目标：让系统不仅“找目标”，还能用语义线索（如 exit sign）影响探索方向。
+
+做法：
+
+* GSAM2 额外跑“cue 检测”（输出 `infer_cue.json`）。
+* `cue_bias_node.py` 根据 cue bbox 在相机视野里的水平偏移 + 当前 yaw，估计 cue 的相对方位，累积成直方图 `/lang/cue_hist`（36 bins）。
+* 初期曾做外部 override（frontier_reranker 发布 goal）但会被 FALCON 内部重规划顶掉。
+
+### 1.4 语义注入内嵌（已生效）
+
+将语义影响从外部 override 改为 **嵌入 FALCON exploration_manager 的决策函数**：
+
+* exploration_manager 订阅 `/lang/cue_hist`
+* 在候选前沿点 topK 上做 rerank：`score = -cost + beta*h`（h 来自 hist bin）
+* 输出 `LangBias-MAIN` debug 日志证明“语义翻盘”发生
+
+> 这一阶段保证：语义项不会被内部重规划抵消，真正进入“最终选择”。
+
+### 1.5 LLM 任务编译层（Schema v0.1，已跑通）
+
+目标：用户自然语言长任务 → 云端一次调用 → 结构化 `plan.json`（含 entities/stages/transitions/criteria）。
+
+* 脚本：`task_compiler_v0.py`
+* 输出：`plan.json`（放入 shared，供中枢读取）
+* 设计：分级 schema + 本地校验（缺字段提示重写；弱字段缺省补全/忽略）
+
+### 1.6 central_runtime（中枢层）v0：按 plan 驱动执行层（已能跑基本逻辑）
+
+目标：替换硬编码 `mission_fsm.py`，实现“数据驱动阶段机”：
+
+* 读取 plan.json
+* 进入阶段时写 prompt（驱动推理侧）
+* 持续读取 infer.json（证据流）
+* 满足条件触发 transition
+* 通过 adapter 启停执行器（SEARCH/FALCON；TRACK stub；NAVIGATE/EGO stub/接入中）
+
+### 1.7 cmd_mux（执行端多算法切换）与当前关键问题（进行中）
+
+目标：实现“同一次任务中切换执行器”，例如：
+
+* S1 SEARCH：FALCON 输出 `/falcon/pos_cmd`
+* S4 NAVIGATE：EGO 输出 `/ego/pos_cmd`
+* mux 选择一路转发到 `/planning/pos_cmd`
+
+当前问题：
+
+* FALCON 与 EGO 使用的 `quadrotor_msgs/PositionCommand` **消息定义不一致**，导致 ROS1 MD5 冲突（4712… vs 2809…），同一 ROS master 下无法共存。
+* 已与业内专家讨论，推荐路线：**统一 PositionCommand 为“超级消息”（并集字段），建立 base_ws 底座，算法层删自带 quadrotor_msgs，全部重新编译并按 workspace overlay source**。
+
+---
+
+## 2. 当前系统总体架构（运行态分层）
+
+### 2.1 四层结构
+
+1. **LLM 编译层（云端一次调用）**
+   自然语言 → `plan.json`
+
+2. **中枢决策层（central_runtime）**
+   plan 执行器：阶段机、证据累计、切换执行器、写入感知请求
+
+3. **多模态感知层（GSAM2）**
+   读 `/shared/frame.jpg` + `/shared/prompt.txt`（以及 cues）→ 输出 `infer.json / infer_cue.json`
+
+4. **执行层（FALCON / EGO）**
+   FALCON：探索/搜索
+   EGO：轨迹规划/导航（正在接入）
+   通过 mux 输出到统一控制口 `/planning/pos_cmd`
+
+---
+
+## 3. 目录与模块结构（到“代码上一级”）
+
+下面给出一个推荐的主机侧项目结构（你现状基本就是这个思路；实际路径可按你的 `/home/young/uav_demo/` 对应）：
+
+```
+/home/young/uav_demo/
+  shared/                         # 与各容器 bind-mount 到 /shared
+    frame.jpg
+    frame_meta.json
+    prompt.txt
+    cues.txt                      # 可选：cue 列表（M3-lite）
+    infer.json
+    infer_vis.jpg
+    infer_cue.json
+    infer_cue_vis.jpg
+    plan.json
+    plan_runtime.jsonl            # central_runtime 运行日志
+    *.pid  *.log                  # adapter 进程记录（可选）
+
+  central_runtime_v0/             # 中枢层（Python）
+    run_plan.py
+    config.yaml
+    central_runtime/
+      plan_loader.py
+      infer_reader.py
+      prompt_controller.py
+      blackboard.py
+      conditions.py
+      executor.py
+      adapters/
+        base.py
+        falcon_search.py
+        track_hold.py
+        navigate_stub.py
+
+  llm/                            # 任务编译（Python）
+    task_compiler_v0.py           # DeepSeek/LLM 编译器
+    (templates / prompts / tests)
+
+  perception_bridge/              # ROS1 辅助节点（Python）
+    frame_dumper.py
+    prompt_writer.py              # 早期 M1 使用（后续可由 central_runtime 替代）
+    json_publisher.py
+    pose_follower.py              # 仿真位姿桥（模型跟随/TF/姿态输入等）
+
+  gsam2_infer/                    # 推理脚本（Python, 无 ROS）
+    infer_loop_vis_guide.py
+
+  lang_explore/                   # 语义线索与探索偏置（ROS1）
+    cue_bias_node.py
+ FALCON
+ EGO
+  docs/
+    架构图、实验记录、schema说明、问题清单
+```
+
+---
+
+## 4. 各模块脚本说明（按“输入/输出/职责”）
+
+### 4.1 shared 文件总线协议（核心接口）
+
+**生产者/消费者必须遵守“原子写入”**（先写 tmp 再 replace），避免读到半截文件。
+
+* 输入：
+
+  * `frame.jpg`：最新 RGB 帧（frame_dumper 写）
+  * `prompt.txt`：主检测目标（central_runtime 或 prompt_writer 写）
+  * `cues.txt`：cue 列表（可选，infer_loop 读取）
+  * `plan.json`：任务计划（LLM 编译输出）
+
+* 输出：
+
+  * `infer.json`：主目标检测结果（infer_loop 写；json_publisher 读）
+  * `infer_vis.jpg`：主目标可视化（infer_loop 写）
+  * `infer_cue.json`：cue 检测结果（infer_loop 写；cue_bias_node 读）
+  * `infer_cue_vis.jpg`：cue 可视化
+  * `plan_runtime.jsonl`：中枢运行日志（central_runtime 写）
+
+#### infer.json 典型字段（你现在已经在用）
+
+```json
+{
+  "found": false,
+  "score": 0.0,
+  "bbox": null,
+  "class_name": null,
+  "t_wall": 1767862803.778975,
+  "vis_path": "/shared/infer_vis.jpg"
+}
+```
+
+---
+
+### 4.2 perception_bridge（ROS1 辅助节点）
+
+#### A) `frame_dumper.py`
+
+* **订阅**：`/camera/image_raw`（可配置）
+* **输出文件**：`/shared/frame.jpg` + `frame_meta.json`
+* **职责**：把 ROS 图像流稳定落盘（JPEG），为推理侧提供输入
+
+#### B) `prompt_writer.py`（M1 版本使用；后续可由 central_runtime 取代）
+
+* **订阅**：`/mission/text_goal`（String）
+* **输出文件**：`/shared/prompt.txt`
+* **职责**：把用户/上层给的文本目标转换为 GSAM2 需要的 prompt（lowercase + 句点）
+
+#### C) `json_publisher.py`
+
+* **输入文件**：`/shared/infer.json`
+* **输出话题**：`/perception/target_found`（Bool, latch）
+* **职责**：对推理输出做**k 次命中 / k 次丢失滤波**，把“检测结果”变成可用于状态机的稳定布尔事件
+
+#### D) `pose_follower.py`
+
+* **作用**：仿真中的模型位姿/TF/跟随等桥接（用于让系统各模块获得一致姿态来源）
+* **说明**：它属于“平台底座”的一部分，后续建议与算法层解耦，常驻运行
+
+---
+
+### 4.3 gsam2_infer（推理侧，无 ROS）
+
+#### `infer_loop_vis_guide.py`
+
+* **输入文件**：
+
+  * `/shared/frame.jpg`
+  * `/shared/prompt.txt`
+  * `/shared/cues.txt`（可选）
+* **输出文件**：
+
+  * `/shared/infer.json` + `infer_vis.jpg`
+  * `/shared/infer_cue.json` + `infer_cue_vis.jpg`
+* **职责**：
+
+  1. 主目标：GroundingDINO 找 bbox → SAM2 分割 → 写 infer.json（found/score/bbox）
+  2. cue：以较低阈值周期性检测 cue → 写 infer_cue.json（供 cue_bias_node 使用）
+* **性能策略**：FP16 autocast（BF16 因 ms_deform_attn CUDA op 不支持而失败）
+
+---
+
+### 4.4 lang_explore（语义线索 → 方向偏置）
+
+#### `cue_bias_node.py`
+
+* **输入**：
+
+  * `infer_cue.json`（bbox + score）
+  * `/uav_simulator/odometry`（可配置 odom topic）
+* **输出**：
+
+  * `/lang/cue_hist`（Float32MultiArray，bins=36）
+* **职责**：
+
+  * 将 bbox 在图像水平偏移映射成 yaw 偏移（通过 HFOV）
+  * 把 cue 方位累计为直方图（带时间衰减 decay）
+  * 供 FALCON exploration_manager 内嵌的语义项使用
+
+---
+
+### 4.5 执行层（传统算法）
+
+#### FALCON（ROS1，通常在 `falcon_noetic` 容器）
+
+* **核心输出**：`/planning/pos_cmd`（或经 remap 成 `/falcon/pos_cmd`）
+* **语义注入**（已做）：
+
+  * exploration_manager 订阅 `/lang/cue_hist`
+  * 在 SOP 给出的候选 frontier topK 上 rerank
+  * debug 日志 `LangBias-MAIN` 用于确认语义翻盘
+
+#### EGO-Planner（已部署，接入中）
+
+* **预期输出**：`/ego/pos_cmd`
+* **当前接入工作重点**：
+
+  * 与 mux/控制链路统一 PositionCommand 定义（解决 MD5 冲突）
+  * 将导航目标（例如出口点）以 waypoint/goal 的形式输入 EGO
+
+---
+
+### 4.6 LLM 编译层（云端一次调用）
+
+#### `task_compiler_v0.py`
+
+* **输入**：用户自然语言长任务
+* **输出**：`plan.json`（schema v0.1）
+* **核心逻辑**：
+
+  * prompt 约束 LLM 输出字段结构
+  * 本地校验：缺必需字段 → ok=false + missing_required + rewrite_hint
+  * 容错：None/类型不合法 → fallback/修复（已修过 budget=None 崩溃）
+
+---
+
+### 4.7 central_runtime（中枢层：计划执行器）
+
+#### `run_plan.py`
+
+* CLI：`python3 run_plan.py --plan ... --config config.yaml`
+* 装配 executor / infer_reader / prompt_controller / adapters
+* 启动主循环
+
+#### `central_runtime/executor.py`
+
+* **职责**：plan 运行时核心
+
+  * 进入 stage：写 prompt（驱动推理）
+  * tick：读 infer.json → 更新 blackboard（证据）
+  * 检查 success/fail criteria → 触发 transition
+  * 调 adapter enter/exit：启停对应执行器（SEARCH 启 Falcon；NAVIGATE 启 EGO 等）
+  * 写 jsonl 日志（便于复盘）
+
+#### adapters（执行器适配层）
+
+* `adapters/falcon_search.py`：在指定容器中启动/停止 roslaunch（SEARCH）
+* `adapters/navigate_stub.py`：NAVIGATE 的占位实现（后续对接 EGO）
+* `adapters/track_hold.py`：TRACK 的最小实现（例如 hold/打印/等待）
+
+> 设计原则：**中枢不改算法内部，只通过“适配层”启停/切换，并通过共享的证据接口控制阶段推进**。
+
+---
+
+## 5. 当前“完整运行链路”与数据流（你现在的系统逻辑）
+
+你当前列出的启动项（主机/容器混跑）逻辑如下：
+
+1. **仿真底座**
+   `gazebo_ros empty_world.launch ... complex_office.world`
+   提供环境与传感器话题（相机、odom 等）
+
+2. **位姿/状态桥**
+   `pose_follower.py`
+   确保系统中位姿来源一致（给规划/控制使用）
+
+3. **感知输入落盘**
+   `frame_dumper.py`（订阅相机）→ 写 `/shared/frame.jpg`
+
+4. **推理（GSAM2）**
+   `infer_loop_vis_guide.py` 读 `/shared/frame.jpg + prompt.txt (+ cues.txt)` → 写 `infer.json / infer_cue.json`
+
+5. **检测事件发布**
+   `json_publisher.py` 读 `infer.json` → 发布 `/perception/target_found`
+
+6. **cue → hist**
+   `cue_bias_node.py` 读 `infer_cue.json + odom` → 发布 `/lang/cue_hist`
+
+7. **计划执行**
+   `run_plan.py` 读 `plan.json`：
+
+* stage enter：写 prompt（更新 prompt.txt / cues 等）
+* tick：读 infer.json（证据），触发 transition
+* adapter：启/停 FALCON（以及后续 EGO）来实现阶段动作
+
+> 关键闭环：FALCON 的探索决策已内嵌 `/lang/cue_hist`，因此 cue 信号能够真实影响飞行方向。
+
+---
+
+## 6. 当前关键工程阻塞：PositionCommand MD5 冲突（cmd_mux / 多执行器切换）
+
+### 现象
+
+同时运行 Falcon 与 EGO（或它们的控制链路）会出现类似：
+
+* `/so3_control` 期望 `PositionCommand` MD5 = 4712…，但 topic 实际是 2809…
+* 或反向（启动顺序变化）
+
+结论：
+
+* 同名 `quadrotor_msgs/PositionCommand` 在两套代码中定义不同，ROS1 强制 MD5 校验导致断连。
+* 这不是 “mux 逻辑问题”，而是 **系统底座接口契约不统一**。
+
+---
+
+
+## 8. 附：Schema v0.1（给工程师的最小理解）
+
+一个 plan 至少包含：
+
+* `entities[]`：实体定义（E_car / E_exit / cue）
+* `stages[]`：阶段（S1 SEARCH、S4 NAVIGATE…）
+* `transitions[]`：阶段切换条件（PERCEPTION_FOUND/TIMEOUT/VERIFIED…）
+* 每个阶段可包含 `success_criteria[] / fail_criteria[]`（结构化事件条件）
+
+central_runtime 的 executor 基于这些字段实现“数据驱动阶段机”。
+
+
+# 附件 1：Runbook（启动顺序、命令、排障）
+
+## A. 总体启动顺序（推荐）
+
+1. **仿真底座**（Gazebo + 里程计/TF/控制器）
+2. **数据桥接**（pose_follower）
+3. **相机落盘**（frame_dumper → /shared/frame.jpg）
+4. **推理**（infer_loop → infer.json / infer_cue.json）
+5. **事件发布**（json_publisher → /perception/target_found 等）
+6. **语义 cue_hist**（cue_bias_node → /lang/cue_hist）
+7. **FALCON 执行器**（由 central_runtime 的 adapter 启停）
+8. **central_runtime**（run_plan.py）
+
+> 原则：底座常驻（1~2），感知链路常驻（3~6），执行器由中枢调度（7），中枢最后起（8）。
+
+---
+
+## B. 当前你系统里常用启动命令（示例）
+
+### 1) Gazebo
+
+```bash
+roslaunch gazebo_ros empty_world.launch use_sim_time:=false \
+  world_name:=/root/catkin_ws/src/gazebo/worlds/complex_office.world
+```
+
+### 2) 位姿桥（pose_follower）
+
+```bash
+rosrun perception_bridge pose_follower.py _model_name:=gz_uav
+```
+
+### 3) 相机帧落盘
+
+```bash
+rosrun perception_bridge frame_dumper.py _imagtopic:=/camera/image_raw \
+  _rate_hz:=2.0 _out_dir:=/shared
+```
+
+### 4) GSAM2 推理
+
+```bash
+python3 infer_loop_vis_guide.py
+```
+
+### 5) 推理结果→ROS 事件
+
+```bash
+rosrun perception_bridge json_publisher.py _infer_path:=/shared/infer.json \
+  _score_thresh:=0.35 _k_confirm:=2 _k_lost:=5
+```
+
+### 6) cue → cue_hist
+
+```bash
+rosrun lang_explore cue_bias_node.py \
+  _infer_cue_json:=/shared/infer_cue.json \
+  _odom_topic:=/uav_simulator/odometry \
+  _hfov_deg:=90.0 \
+  _score_th:=0.5 \
+  _bins:=36 \
+  _decay:=0.98
+```
+
+### 7) 中枢运行（plan 执行）
+
+```bash
+python3 run_plan.py --plan /home/young/uav_demo/shared/plan.json --config config.yaml
+```
+
+---
+
+## C. 最小健康检查（每个环节 10 秒定位）
+
+### /shared 文件链路
+
+```bash
+ls -lh /home/young/uav_demo/shared
+watch -n 0.5 "stat /home/young/uav_demo/shared/frame.jpg; tail -n 3 /home/young/uav_demo/shared/plan_runtime.jsonl"
+```
+
+### 关键 ROS topics
+
+```bash
+rostopic hz /camera/image_raw
+rostopic echo -n 1 /perception/target_found
+rostopic echo -n 1 /lang/cue_hist
+```
+
+### FALCON 是否在发控制
+
+```bash
+rostopic hz /planning/pos_cmd
+```
+
+---
+
+## D. 当前最常见阻塞与定位
+
+### 1) PositionCommand MD5 冲突（你现在的核心问题）
+
+症状：`Dropping connection`，同名 `quadrotor_msgs/PositionCommand` MD5 不一致。
+定位：
+
+```bash
+rosmsg md5 quadrotor_msgs/PositionCommand
+rospack find quadrotor_msgs
+```
+
+处理：走“base_ws 统一消息 + 全部重新编译 + overlay source 顺序”。
+
+### 2) infer.json 更新但 /perception/target_found 一直 false
+
+检查：
+
+* infer.json 的 score 是否过低（`_score_thresh` 太高）
+* `json_publisher` 的 k_confirm 是否太严格
+* infer.json 是否在写同一个实体（prompt 是否更新）
+
+### 3) cue_hist 没峰值
+
+检查：
+
+* infer_cue.json 是否更新
+* cue score 阈值 `_score_th`
+* odom topic 是否正确（yaw 依赖 odom）
+
+---
+
+# 附件 2：接口契约（shared 文件 / ROS topic / mux）
+
+## A. shared 文件协议（必须遵守原子写）
+
+### 输入
+
+* `frame.jpg`：最新帧
+* `prompt.txt`：当前主目标（如 `car.` / `safe exit.`）
+* `cues.txt`（可选）：cue 列表（每行一个，如 `exit sign`）
+* `plan.json`：LLM 生成的任务图
+
+### 输出（推理侧）
+
+* `infer.json`：主目标结果
+* `infer_vis.jpg`：主目标可视化
+* `infer_cue.json`：cue 结果
+* `infer_cue_vis.jpg`：cue 可视化
+
+### infer.json schema（最小）
+
+```json
+{
+  "found": true/false,
+  "score": float,
+  "bbox": [x1,y1,x2,y2] | null,
+  "class_name": "car" | null,
+  "t_wall": float_seconds,
+  "vis_path": "/shared/infer_vis.jpg"
+}
+```
+
+### 运行日志（中枢）
+
+* `plan_runtime.jsonl`：每 tick 写入 blackboard、stage、transition 触发原因
+
+---
+
+## B. ROS topics（当前已用 + 扩展方向）
+
+### 执行控制
+
+* `/planning/pos_cmd`：系统唯一控制入口（仿真/飞控只订阅这个）
+* `/falcon/pos_cmd`：Falcon 私有输出（建议 remap 出来）
+* `/ego/pos_cmd`：EGO 私有输出（建议 remap 出来）
+
+### 感知事件
+
+* `/perception/target_found`：Bool（由 json_publisher 从 infer.json 滤波产生）
+
+### 语义线索
+
+* `/lang/cue_hist`：Float32MultiArray（bins=36）
+
+---
+
+## C. cmd_mux 契约（建议）
+
+* mux 输入：`/falcon/pos_cmd`、`/ego/pos_cmd`（同一消息定义！）
+* mux 输出：`/planning/pos_cmd`
+* central_runtime 进入 stage 时调用 service 切换输入：
+
+  * SEARCH → select `/falcon/pos_cmd`
+  * NAVIGATE → select `/ego/pos_cmd`
+
+> 注意：mux 只负责“路由”，不负责“兼容”。消息 MD5 不一致必须在编译层统一。
+
+
+

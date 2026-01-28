@@ -1,0 +1,10 @@
+FROM ros:noetic-ros-base
+
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    docker.io \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install pyyaml loguru
+
+WORKDIR /home/young/uav_demo/central_runtime_v0

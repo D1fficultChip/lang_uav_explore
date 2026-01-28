@@ -1,0 +1,10 @@
+Log file created at: 2026/01/28 01:04:46
+Running on machine: young
+Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg
+I0128 01:04:46.700796 76903 exploration_node.cpp:24] Exploration task start at 1769580286.700826058
+I0128 01:04:48.023068 76903 exploration_fsm.cpp:58] --------------------START OF CALLBACK--------------------
+I0128 01:04:48.023082 76903 exploration_fsm.cpp:73] [FSM] Current state: INIT, callback rate: 0Hz
+I0128 01:04:48.838843 76903 exploration_fsm.cpp:58] --------------------START OF CALLBACK--------------------
+I0128 01:04:48.838856 76903 exploration_fsm.cpp:73] [FSM] Current state: INIT, callback rate: 1.22583Hz
+I0128 01:04:49.664050 76903 exploration_fsm.cpp:58] --------------------START OF CALLBACK--------------------
+I0128 01:04:49.664068 76903 exploration_fsm.cpp:73] [FSM] Current state: INIT, callback rate: 1.21878Hz

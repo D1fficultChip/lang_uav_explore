@@ -43,16 +43,42 @@ class Blackboard:
         return bool(det.found and det.score >= float(min_score))
 
     def update_hit_streak(self, entity_id: str, min_score: float) -> int:
-        """Update and return consecutive-hit streak for (entity_id,min_score) based on latest detection."""
+        """
+        Update and return consecutive-hit streak for (entity_id,min_score).
+
+        Fix: streak only increases when NEW evidence arrives (det.t_wall advances).
+        Also: if detection is too old, treat as miss to avoid "stale hit" accumulating.
+        """
         st = self._get_state(entity_id, min_score)
         det = self.latest.get(entity_id)
         now = time.time()
-        t_det = det.t_wall if det is not None else now
+
+        if det is None:
+            st.streak = 0
+            st.visible_since = None
+            st.last_update_t = None
+            return 0
+
+        t_det = float(det.t_wall)
+
+        # 1) stale-protection: if det hasn't been updated for a while, do NOT keep counting it
+        #    (tune this threshold; start with 0.5~1.0s)
+        MAX_DET_AGE_S = 1.0
+        if (now - t_det) > MAX_DET_AGE_S:
+            st.streak = 0
+            st.visible_since = None
+            # note: keep last_update_t as-is or set to t_det; either is fine
+            st.last_update_t = t_det
+            return 0
+
+        # 2) Only count when NEW evidence arrives
+        if st.last_update_t is not None and t_det <= float(st.last_update_t) + 1e-6:
+            # same evidence as last time → do not change streak
+            return st.streak
 
         hit = self.is_hit(entity_id, min_score)
         if hit:
             st.streak += 1
-            # visible window
             if st.visible_since is None:
                 st.visible_since = t_det
         else:
