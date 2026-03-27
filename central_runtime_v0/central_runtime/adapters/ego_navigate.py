@@ -1,37 +1,50 @@
 from __future__ import annotations
-import os
 import shlex
 import subprocess
 import time
+import re
 from typing import Any, Dict, Optional, List
 
-def _run(cmd: List[str], detach: bool = False) -> None:
-    """
-    Run command on host. If detach=True, start process and return immediately.
-    """
-    if detach:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return
-    subprocess.run(cmd, check=False)
+# -----------------------------------------------------------------------------
+# Helper: Parse target string (复用自 DockerRoslaunchAdapter)
+# -----------------------------------------------------------------------------
+def _parse_target(container: str):
+    s = (container or "").strip()
 
-def _docker_exec(container: str, bash_cmd: str, detach: bool = False) -> None:
-    """
-    docker exec [-d] <container> bash -lc "<bash_cmd>"
-    """
-    base = ["docker", "exec"]
-    if detach:
-        base.append("-d")
-    base += [container, "bash", "-lc", bash_cmd]
-    _run(base, detach=False)
+    if s.startswith("sshpass:"):
+        s = s[len("sshpass:"):]
+        mode = "sshpass"
+    elif s.startswith("ssh://"):
+        s = s[len("ssh://"):]
+        mode = "ssh"
+    elif s.startswith("ssh:"):
+        s = s[len("ssh:"):]
+        mode = "ssh"
+    else:
+        return ("docker", s, None, None)
+
+    identity = None
+    # allow query style ?i=/path
+    if "?" in s:
+        s, q = s.split("?", 1)
+        m = re.search(r"(?:^|&)i=([^&]+)", q)
+        if m:
+            identity = m.group(1)
+
+    port = None
+    # parse host:port if exists (but not IPv6)
+    m = re.match(r"^(?P<who>[^:]+):(?P<port>\d+)$", s)
+    if m:
+        s = m.group("who")
+        port = int(m.group("port"))
+
+    target = s
+    return (mode, target, port, identity)
 
 def _fmt_pose_stamped_yaml(frame_id: str, x: float, y: float, z: float, yaw: Optional[float] = None) -> str:
     """
     Build a minimal PoseStamped yaml for rostopic pub.
-    We keep orientation w=1 (no yaw) by default.
-    If yaw is provided, you can extend to quaternion later.
     """
-    # Minimal, safe formatting
-    # NOTE: using w=1 avoids quaternion math; you can upgrade later.
     return (
         "{header: {frame_id: '" + frame_id + "'}, "
         "pose: {position: {x: " + f"{x:.3f}" + ", y: " + f"{y:.3f}" + ", z: " + f"{z:.3f}" + "}, "
@@ -41,9 +54,11 @@ def _fmt_pose_stamped_yaml(frame_id: str, x: float, y: float, z: float, yaw: Opt
 class EgoNavigateAdapter:
     """
     NAVIGATE tool adapter:
-    - Starts EGO planner in ego_noetic container (roslaunch ...)
-    - Publishes a goal once (rostopic pub -1)
-    - Stops EGO on exit (pidfile/pkill fallback)
+    - Starts EGO planner via Docker (local) OR SSH (remote).
+    - Publishes a goal once (rostopic pub -1).
+    - Stops EGO on exit (pidfile/pkill fallback).
+    
+    Refactored to match DockerRoslaunchAdapter pattern.
     """
 
     def __init__(
@@ -60,12 +75,13 @@ class EgoNavigateAdapter:
         default_goal_xyz: Optional[List[float]] = None,
         publish_goal_once: bool = True,
         startup_sleep_s: float = 0.5,
+        ssh_extra_args: Optional[List[str]] = None,
     ):
         self.container = container
         self.launch_cmd = launch_cmd
         self.pidfile = pidfile_in_shared
         self.logfile = logfile_in_shared
-        self.stop_pattern = stop_fallback_pattern
+        self.pattern = stop_fallback_pattern  # 统一命名为 pattern 以匹配习惯
 
         self.goal_topic = goal_topic
         self.goal_frame = goal_frame
@@ -74,19 +90,77 @@ class EgoNavigateAdapter:
 
         self.publish_goal_once = publish_goal_once
         self.startup_sleep_s = float(startup_sleep_s)
+        self.ssh_extra_args = ssh_extra_args or []
+
+        # Parse target immediately
+        self.mode, self.target, self.port, self.identity = _parse_target(container)
+
+    # -------------------------------------------------------------------------
+    # Backends (完全参考 DockerRoslaunchAdapter)
+    # -------------------------------------------------------------------------
+    def _docker(self, args: List[str], detach: bool = False) -> None:
+        base = ["docker", "exec"]
+        if detach:
+            base.append("-d")
+        base.append(self.target)  # container name
+        base.extend(args)
+        subprocess.run(base, check=False)
+
+    def _ssh(self, args: List[str]) -> None:
+        # ssh key 模式：BatchMode=yes（不允许交互）
+        # sshpass 模式：不能 BatchMode=yes，否则不会提示密码，sshpass也没机会喂密码
+        base = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
+
+        if self.mode == "ssh":
+            base += ["-o", "BatchMode=yes"]
+
+        if self.identity:
+            base += ["-i", self.identity]
+        if self.port:
+            base += ["-p", str(self.port)]
+        if self.ssh_extra_args:
+            base += self.ssh_extra_args
+
+        base.append(self.target)
+
+        # 🔥🔥🔥【核心修改】🔥🔥🔥
+        # 必须对 args 里的每一个参数进行 quote (加引号)
+        base.extend([shlex.quote(a) for a in args])  
+
+        if self.mode == "sshpass":
+            # 使用环境变量 SSHPASS
+            base = ["sshpass", "-e"] + base
+
+        subprocess.run(base, check=False)
+
+    def _run(self, args: List[str], detach: bool = False) -> None:
+        if self.mode == "docker":
+            self._docker(args, detach=detach)
+        else:
+            # ssh: detach handled by nohup in bash wrapper; no need ssh -f
+            self._ssh(args)
+
+    # -------------------------------------------------------------------------
+    # Adapter Lifecycle
+    # -------------------------------------------------------------------------
 
     def enter(self, ctx: Dict[str, Any]) -> None:
-        # 1) start EGO roslaunch inside container
-        # We use nohup + PID file in /shared so host can stop it reliably.
-        launch_str = " ".join(shlex.quote(x) for x in self.launch_cmd)
+        # 1) start EGO roslaunch
+        cmd_str = " ".join(shlex.quote(x) for x in self.launch_cmd)
+        
+        # 使用 zsh 启动，确保 source 正确
+        # 注意：这里假设远程也是 zsh 环境，且 setup 文件兼容 zsh (通常 ROS 的 setup.bash 兼容 zsh，或者有 setup.zsh)
+        # 为了稳妥，仍然 source setup.bash，zsh 通常能处理它。如果你确定有 setup.zsh 也可以改。
         bash = (
-            "source /opt/ros/noetic/setup.bash && "
-            "source /root/ego_ws/devel/setup.bash && "
-            f"nohup {launch_str} > {shlex.quote(self.logfile)} 2>&1 & "
-            "echo $! > " + shlex.quote(self.pidfile)
+            "source /opt/ros/noetic/setup.zsh && "
+            "source /home/nv/uav_demo/src/ego_ws/devel/setup.zsh && "
+            f"nohup {cmd_str} > {shlex.quote(self.logfile)} 2>&1 & "
+            f"echo $! > {shlex.quote(self.pidfile)}"
         )
-        _docker_exec(self.container, bash, detach=True)
-        print(f"[Adapter][NAVIGATE][ego] started in {self.container}: {launch_str}")
+        
+        # 按照参考代码，使用 zsh -lc 来执行
+        self._run(["zsh", "-lc", bash], detach=True)
+        print(f"[Adapter][NAVIGATE][ego][{self.mode}] started in {self.target}: {cmd_str}")
 
         # 2) publish goal once (configurable)
         if self.publish_goal_once:
@@ -95,32 +169,31 @@ class EgoNavigateAdapter:
             msg = _fmt_pose_stamped_yaml(self.goal_frame, x, y, z)
 
             pub_cmd = (
-                "source /opt/ros/noetic/setup.bash && "
-                "source /root/ego_ws/devel/setup.bash && "
+                "source /opt/ros/noetic/setup.zsh && "
+                "source /home/nv/uav_demo/src/ego_ws/devel/setup.zsh && "
                 f"rostopic pub -1 {shlex.quote(self.goal_topic)} geometry_msgs/PoseStamped \"{msg}\""
             )
-            _docker_exec(self.container, pub_cmd, detach=False)
-            print(f"[Adapter][NAVIGATE][ego] goal published to {self.goal_topic}: [{x:.2f}, {y:.2f}, {z:.2f}] frame={self.goal_frame}")
+            # 发送 goal 不需要 detach，等它发完就行
+            self._run(["zsh", "-lc", pub_cmd], detach=False)
+            print(f"[Adapter][NAVIGATE][ego] goal published to {self.goal_topic}: [{x:.2f}, {y:.2f}, {z:.2f}]")
     
     def exit(self, ctx: Dict[str, Any]) -> None:
-        # Try PID stop first
+        # Stop by pidfile if present; fallback to pkill -f pattern
+        # 这里的 Shell 脚本逻辑和 DockerRoslaunchAdapter 保持完全一致
         bash = (
-            "if [ -f " + shlex.quote(self.pidfile) + " ]; then "
-            "PID=$(cat " + shlex.quote(self.pidfile) + "); "
-            "kill -INT $PID 2>/dev/null || true; sleep 0.5; "
-            "kill -TERM $PID 2>/dev/null || true; "
-            "rm -f " + shlex.quote(self.pidfile) + "; "
-            "fi; "
-            f"pkill -f {shlex.quote(self.stop_pattern)} 2>/dev/null || true"
+            f"if [ -f {shlex.quote(self.pidfile)} ]; then "
+            f"  PID=$(cat {shlex.quote(self.pidfile)}); "
+            f"  kill -INT $PID 2>/dev/null || true; "
+            f"  sleep 1; "
+            f"  kill -TERM $PID 2>/dev/null || true; "
+            f"  rm -f {shlex.quote(self.pidfile)}; "
+            f"fi; "
+            f"pkill -f {shlex.quote(self.pattern)} 2>/dev/null || true"
         )
-        _docker_exec(self.container, bash, detach=False)
-        print(f"[Adapter][NAVIGATE][ego] stopped in {self.container}")
+        self._run(["zsh", "-lc", bash], detach=False)
+        print(f"[Adapter][NAVIGATE][ego][{self.mode}] stopped in {self.target}")
 
     def _resolve_goal_xyz(self, ctx: Dict[str, Any]):
-        # Priority:
-        # 1) stage policy goal_xyz
-        # 2) entity.extra goal_xyz
-        # 3) default_goal_xyz
         policy = ctx.get("policy") or {}
         if isinstance(policy, dict) and self.goal_key in policy:
             g = policy.get(self.goal_key)
@@ -138,5 +211,4 @@ class EgoNavigateAdapter:
         return float(g[0]), float(g[1]), float(g[2])
     
     def tick(self, ctx):
-    # NAVIGATE 阶段目前不用每tick做事，先占位
         return

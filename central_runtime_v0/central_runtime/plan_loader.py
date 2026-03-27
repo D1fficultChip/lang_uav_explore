@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
@@ -9,6 +9,15 @@ class Entity:
     type: str
     name: str
     prompt: str
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Relation:
+    subject_id: str
+    predicate: str
+    object_id: str
+    description: str = ""
 
 @dataclass
 class Stage:
@@ -32,15 +41,28 @@ class Transition:
 class Plan:
     plan_id: str
     schema_version: str
+    compiled_at: Optional[float]
+    instruction_raw: str
     entities: Dict[str, Entity]
+    relations: List[Relation]
     stages: Dict[str, Stage]
     transitions: List[Transition]
     global_policy: Dict[str, Any]
+    assumptions: List[str]
+    open_questions: List[str]
 
     def outgoing(self, stage_id: str) -> List[Transition]:
         return [t for t in self.transitions if t.fr == stage_id]
 
-def load_plan(path: str) -> Plan:
+def _normalize_intent(intent: str, intent_alias: Optional[Dict[str, str]]) -> str:
+    raw = str(intent or "").strip()
+    if not raw:
+        return raw
+    alias = intent_alias or {}
+    return str(alias.get(raw, alias.get(raw.upper(), raw))).upper()
+
+
+def load_plan(path: str, intent_alias: Optional[Dict[str, str]] = None) -> Plan:
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -51,15 +73,31 @@ def load_plan(path: str) -> Plan:
             type=e.get("type", ""),
             name=e.get("name", ""),
             prompt=e.get("prompt", ""),
+            extra=e.get("extra") or {},
         )
         entities[ent.id] = ent
+
+    relations: List[Relation] = []
+    for r in raw.get("relations", []):
+        if not isinstance(r, dict):
+            continue
+        if "subject_id" not in r or "predicate" not in r or "object_id" not in r:
+            continue
+        relations.append(
+            Relation(
+                subject_id=str(r["subject_id"]),
+                predicate=str(r["predicate"]),
+                object_id=str(r["object_id"]),
+                description=str(r.get("description", "")),
+            )
+        )
 
     stages: Dict[str, Stage] = {}
     for s in raw.get("stages", []):
         st = Stage(
             stage_id=s["stage_id"],
             name=s.get("name", s["stage_id"]),
-            intent=s.get("intent", ""),
+            intent=_normalize_intent(s.get("intent", ""), intent_alias),
             primary_targets=list(s.get("primary_targets", [])),
             policy=s.get("policy"),
             budget=s.get("budget") or {},
@@ -76,10 +114,15 @@ def load_plan(path: str) -> Plan:
     plan = Plan(
         plan_id=raw.get("plan_id", "unknown"),
         schema_version=raw.get("schema_version", ""),
+        compiled_at=raw.get("compiled_at"),
+        instruction_raw=raw.get("instruction_raw", ""),
         entities=entities,
+        relations=relations,
         stages=stages,
         transitions=transitions,
         global_policy=raw.get("global_policy") or {},
+        assumptions=list(raw.get("assumptions", [])),
+        open_questions=list(raw.get("open_questions", [])),
     )
 
     validate_plan(plan)
@@ -98,6 +141,10 @@ def validate_plan(plan: Plan) -> None:
         for eid in st.primary_targets:
             if eid not in plan.entities:
                 raise ValueError(f"stage {sid} primary_targets references missing entity_id={eid}")
+        for idx, ev in enumerate(st.success_criteria):
+            _validate_event(ev, plan.entities, ctx=f"stage {sid} success_criteria[{idx}]")
+        for idx, ev in enumerate(st.failure_criteria):
+            _validate_event(ev, plan.entities, ctx=f"stage {sid} failure_criteria[{idx}]")
 
     sid_set = set(plan.stages.keys())
     for tr in plan.transitions:

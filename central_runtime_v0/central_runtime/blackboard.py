@@ -10,6 +10,7 @@ class HitState:
     streak: int = 0
     visible_since: Optional[float] = None
     last_update_t: Optional[float] = None  # wall time
+    miss_streak: int = 0
 
 class Blackboard:
     """Holds latest detections and per-(entity,threshold) streak state for condition evaluators."""
@@ -55,6 +56,7 @@ class Blackboard:
 
         if det is None:
             st.streak = 0
+            st.miss_streak = 0
             st.visible_since = None
             st.last_update_t = None
             return 0
@@ -66,6 +68,7 @@ class Blackboard:
         MAX_DET_AGE_S = 1.0
         if (now - t_det) > MAX_DET_AGE_S:
             st.streak = 0
+            st.miss_streak = 0
             st.visible_since = None
             # note: keep last_update_t as-is or set to t_det; either is fine
             st.last_update_t = t_det
@@ -79,14 +82,49 @@ class Blackboard:
         hit = self.is_hit(entity_id, min_score)
         if hit:
             st.streak += 1
+            st.miss_streak = 0
             if st.visible_since is None:
                 st.visible_since = t_det
         else:
             st.streak = 0
+            st.miss_streak += 1
             st.visible_since = None
 
         st.last_update_t = t_det
         return st.streak
+
+    def update_miss_streak(self, entity_id: str, min_score: float) -> int:
+        """
+        Update and return consecutive-miss streak for (entity_id,min_score).
+        A miss is counted only when NEW evidence arrives and does not satisfy the hit rule.
+        """
+        st = self._get_state(entity_id, min_score)
+        det = self.latest.get(entity_id)
+        now = time.time()
+
+        if det is None:
+            st.miss_streak = 0
+            st.last_update_t = None
+            return 0
+
+        t_det = float(det.t_wall)
+        MAX_DET_AGE_S = 1.0
+        if (now - t_det) > MAX_DET_AGE_S:
+            st.miss_streak = 0
+            st.last_update_t = t_det
+            return 0
+
+        if st.last_update_t is not None and t_det <= float(st.last_update_t) + 1e-6:
+            return st.miss_streak
+
+        hit = self.is_hit(entity_id, min_score)
+        if hit:
+            st.miss_streak = 0
+        else:
+            st.miss_streak += 1
+
+        st.last_update_t = t_det
+        return st.miss_streak
 
     def visible_duration(self, entity_id: str, min_score: float) -> float:
         st = self._get_state(entity_id, min_score)

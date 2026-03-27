@@ -25,4 +25,15 @@ exploration_manager:
     conf_min: 0.2
     smooth_win: 2
     debug: true
+    topk: 8
+    focus_peakiness_th: 0.45
+    focus_min_h: 0.65
+    focus_rel_h_th: 0.85
+    focus_viewpoint_min_h: 0.60
+    focus_penalty: 30.0
+    focus_bonus: 10.0
+    ctrl_timeout: 1.0
+    ctrl_focus_conf_th: 0.45
+    ctrl_focus_urgency_th: 0.55
+    ctrl_bearing_bonus: 0.35
   

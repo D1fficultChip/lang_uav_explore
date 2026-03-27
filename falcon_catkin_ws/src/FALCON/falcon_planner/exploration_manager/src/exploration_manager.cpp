@@ -1,5 +1,6 @@
 #include <fstream>
 #include <iostream>
+#include <cmath>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <ros/package.h>
@@ -50,9 +51,21 @@ void ExplorationManager::initialize(ros::NodeHandle &nh) {
   nh.param("lang/smooth_win", lang_smooth_win_, 1);
   nh.param("lang/debug", lang_debug_, true);
   nh.param("lang/topk", lang_topk_, 8);
+  nh.param("lang/focus_peakiness_th", lang_focus_peakiness_th_, 0.45);
+  nh.param("lang/focus_min_h", lang_focus_min_h_, 0.65);
+  nh.param("lang/focus_rel_h_th", lang_focus_rel_h_th_, 0.85);
+  nh.param("lang/focus_viewpoint_min_h", lang_focus_viewpoint_min_h_, 0.60);
+  nh.param("lang/focus_penalty", lang_focus_penalty_, 30.0);
+  nh.param("lang/focus_bonus", lang_focus_bonus_, 10.0);
+  nh.param("lang/ctrl_timeout", lang_ctrl_timeout_, 1.0);
+  nh.param("lang/ctrl_focus_conf_th", lang_ctrl_focus_conf_th_, 0.45);
+  nh.param("lang/ctrl_focus_urgency_th", lang_ctrl_focus_urgency_th_, 0.55);
+  nh.param("lang/ctrl_bearing_bonus", lang_ctrl_bearing_bonus_, 0.35);
 
   cue_hist_sub_ = nh.subscribe("/lang/cue_hist", 1,
                               &ExplorationManager::cueHistCb, this);
+  semantic_ctrl_sub_ = nh.subscribe("/lang/semantic_ctrl", 1,
+                              &ExplorationManager::semanticCtrlCb, this);
 
   // Disable hybrid search for small map
   Position bbox_min, bbox_max;
@@ -625,6 +638,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
     // ===== Lang bias (MAIN): rerank SOP output before assigning to frontier_ids =====
     if (lang_enable_ && lang_beta_ > 1e-9 && !frontier_ids_from_sop_path.empty()) {
       const int K = std::min<int>(lang_topk_, (int)frontier_ids_from_sop_path.size());
+      const bool focus_active = langFocusActive();
 
       struct CandDbg {
         int fid;
@@ -640,7 +654,8 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
       int best_j = 0;
       double best_score = -std::numeric_limits<double>::infinity();
       int best_fid = frontier_ids_from_sop_path[0];
-      double best_cost = 0.0, best_h = 0.0;
+      double best_cost = std::numeric_limits<double>::infinity();
+      double best_h = -std::numeric_limits<double>::infinity();
 
       // 计算 topK 候选的 cost/h/score，并找 best
       for (int j = 0; j < K; ++j) {
@@ -659,11 +674,22 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         const double h = langBonus(pos, yaw[0], p);
 
         // “越大越好”的综合得分
-        const double score = -cost + lang_beta_ * h;
+        const double score = -applyLangBias(cost, h);
 
         dbg.push_back({fid, j, cost, h, score});
 
-        if (score > best_score) {
+        bool take = false;
+        if (focus_active) {
+          if (h > best_h + 1e-6) {
+            take = true;
+          } else if (std::abs(h - best_h) <= 1e-6 && cost < best_cost) {
+            take = true;
+          }
+        } else if (score > best_score) {
+          take = true;
+        }
+
+        if (take) {
           best_score = score;
           best_j = j;
           best_fid = fid;
@@ -686,6 +712,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         ss << "[LangBias-MAIN] seq=" << seq
           << " topK=" << K
           << " enable=" << (int)lang_enable_
+          << " focus=" << (int)focus_active
           << " beta=" << std::fixed << std::setprecision(2) << lang_beta_
           << "\n";
 
@@ -714,6 +741,44 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         ROS_WARN_STREAM_THROTTLE(0.5, ss.str());  // 你想更频繁就把 0.5 调小
       }
       // ============================================================
+
+      if (focus_active && !dbg.empty()) {
+        const double keep_th = std::max(lang_focus_min_h_, lang_focus_rel_h_th_ * best_h);
+        std::vector<int> focused_frontiers;
+        std::vector<int> deferred_frontiers;
+        focused_frontiers.reserve(frontier_ids_from_sop_path.size());
+        deferred_frontiers.reserve(frontier_ids_from_sop_path.size());
+
+        for (int fid : frontier_ids_from_sop_path) {
+          const Eigen::Vector3d& p = ed_->points_[fid];
+          const double h = langBonus(pos, yaw[0], p);
+          if (h >= keep_th) {
+            focused_frontiers.push_back(fid);
+          } else {
+            deferred_frontiers.push_back(fid);
+          }
+        }
+
+        if (!focused_frontiers.empty()) {
+          frontier_ids_from_sop_path.clear();
+          frontier_ids_from_sop_path.insert(frontier_ids_from_sop_path.end(), focused_frontiers.begin(), focused_frontiers.end());
+          frontier_ids_from_sop_path.insert(frontier_ids_from_sop_path.end(), deferred_frontiers.begin(), deferred_frontiers.end());
+          if (lang_debug_) {
+            ROS_WARN_THROTTLE(
+                0.5,
+                "[LangBias-MAIN] focus frontier filtering kept=%zu deferred=%zu keep_th=%.3f best_h=%.3f",
+                focused_frontiers.size(), deferred_frontiers.size(), keep_th, best_h);
+          }
+        }
+      }
+
+      best_j = 0;
+      for (int j = 0; j < (int)frontier_ids_from_sop_path.size(); ++j) {
+        if (frontier_ids_from_sop_path[j] == best_fid) {
+          best_j = j;
+          break;
+        }
+      }
 
       // swap：把 pick 的 frontier 提到 index 0（保持你原来的策略）
       if (best_j != 0) {
@@ -769,6 +834,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
     vector<Position> cell_frontier_viewpoints;
     vector<double> cell_frontier_yaws;
     vector<double> cell_frontier_costs;
+    vector<double> cell_frontier_lang_hs;
     for (int i = 0; i < ed_->averages_.size(); i++) {
       if (hierarchical_grid_->getLayerCellId(0, ed_->averages_[i]) == next_cell_id_grid_tour2) {
         // If the frontier's average is in the next grid cell, evaluate its cost from current
@@ -788,13 +854,14 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         double cost_biased = cost;
         if (lang_enable_ && lang_beta_ > 1e-9) {
           h = langBonus(pos, yaw[0], ed_->points_[i]);          // 0~1
-          cost_biased = cost - lang_beta_ * h;
+          cost_biased = applyLangBias(cost, h);
         }
         // ============================================================
 
         cell_frontier_viewpoints.push_back(ed_->points_[i]);
         cell_frontier_yaws.push_back(ed_->yaws_[i]);
         cell_frontier_costs.push_back(cost_biased);
+        cell_frontier_lang_hs.push_back(h);
 
         if (lang_debug_) {
           ROS_INFO(
@@ -832,6 +899,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
           cell_frontier_viewpoints.push_back(ed_->points_[i]);
           cell_frontier_yaws.push_back(ed_->yaws_[i]);
           cell_frontier_costs.push_back(cost);
+          cell_frontier_lang_hs.push_back(0.0);
 
           ROS_INFO(
               "[ExplorationManager] Frontier %d average is in the next grid cell with cost: "
@@ -845,9 +913,28 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
 
     if (cell_frontier_viewpoints.size() > 0) {
       // Find the viewpoint with minimum cost, greedy
-      std::vector<double>::iterator min_cost_it =
-          std::min_element(cell_frontier_costs.begin(), cell_frontier_costs.end());
-      int min_cost_id = std::distance(cell_frontier_costs.begin(), min_cost_it);
+      int min_cost_id = 0;
+      if (langFocusActive() && !cell_frontier_lang_hs.empty()) {
+        const double best_h = *std::max_element(cell_frontier_lang_hs.begin(), cell_frontier_lang_hs.end());
+        const double keep_th = std::max(lang_focus_viewpoint_min_h_, lang_focus_rel_h_th_ * best_h);
+        double min_cost = std::numeric_limits<double>::max();
+        bool found_focus = false;
+        for (int i = 0; i < (int)cell_frontier_costs.size(); ++i) {
+          if (cell_frontier_lang_hs[i] < keep_th) continue;
+          if (cell_frontier_costs[i] < min_cost) {
+            min_cost = cell_frontier_costs[i];
+            min_cost_id = i;
+            found_focus = true;
+          }
+        }
+        if (!found_focus) {
+          auto min_cost_it = std::min_element(cell_frontier_costs.begin(), cell_frontier_costs.end());
+          min_cost_id = std::distance(cell_frontier_costs.begin(), min_cost_it);
+        }
+      } else {
+        auto min_cost_it = std::min_element(cell_frontier_costs.begin(), cell_frontier_costs.end());
+        min_cost_id = std::distance(cell_frontier_costs.begin(), min_cost_it);
+      }
 
       next_pos = cell_frontier_viewpoints[min_cost_id];
       next_yaw = cell_frontier_yaws[min_cost_id];
@@ -880,7 +967,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         double cost_biased = cost;
         if (lang_enable_ && lang_beta_ > 1e-9) {
           h = langBonus(pos, yaw[0], ed_->points_[i]);   // 注意这里用 pos/yaw[0]（当前姿态）
-          cost_biased = cost - lang_beta_ * h;
+          cost_biased = applyLangBias(cost, h);
         }
         // ============================================================
 
@@ -918,7 +1005,7 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
           double cost_biased = cost_i;
           if (lang_enable_ && lang_beta_ > 1e-9) {
             h = langBonus(pos, yaw[0], ed_->points_[i]);
-            cost_biased = cost_i - lang_beta_ * h;
+            cost_biased = applyLangBias(cost_i, h);
           }
           // =====================
 
@@ -978,6 +1065,8 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
       double min_cost = 100000;
       int min_cost_id = -1;
       vector<Vector3d> tmp_path;
+      std::vector<double> viewpoint_hs;
+      viewpoint_hs.reserve(ed_->n_points_[0].size());
       for (int i = 0; i < ed_->n_points_[0].size(); ++i) {
         auto tmp_cost = PathCostEvaluator::computeCost(pos, ed_->n_points_[0][i], yaw[0],
                                                       ed_->n_yaws_[0][i], vel, yaw[1], tmp_path);
@@ -987,18 +1076,40 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
         double cost_biased = double(tmp_cost);
         if (lang_enable_ && lang_beta_ > 1e-9) {
           h = langBonus(pos, yaw[0], ed_->n_points_[0][i]);
-          cost_biased = double(tmp_cost) - lang_beta_ * h;
+          cost_biased = applyLangBias(double(tmp_cost), h);
         }
+        viewpoint_hs.push_back(h);
         // =====================
+
+        if (lang_debug_) {
+          ROS_INFO("[ExplorationManager][LangBias-D] i=%d cost=%.2lf h=%.2lf cost'=%.2lf",
+                  i, double(tmp_cost), h, cost_biased);
+        }
 
         if (cost_biased < min_cost) {
           min_cost = cost_biased;
           min_cost_id = i;
         }
+      }
 
-        if (lang_debug_) {
-          ROS_INFO("[ExplorationManager][LangBias-D] i=%d cost=%.2lf h=%.2lf cost'=%.2lf",
-                  i, double(tmp_cost), h, cost_biased);
+      if (langFocusActive() && !viewpoint_hs.empty()) {
+        const double best_h = *std::max_element(viewpoint_hs.begin(), viewpoint_hs.end());
+        const double keep_th = std::max(lang_focus_viewpoint_min_h_, lang_focus_rel_h_th_ * best_h);
+        double focus_min_cost = std::numeric_limits<double>::max();
+        int focus_min_id = -1;
+        for (int i = 0; i < (int)viewpoint_hs.size(); ++i) {
+          if (viewpoint_hs[i] < keep_th) continue;
+          vector<Vector3d> focus_path;
+          auto tmp_cost = PathCostEvaluator::computeCost(pos, ed_->n_points_[0][i], yaw[0],
+                                                        ed_->n_yaws_[0][i], vel, yaw[1], focus_path);
+          const double cost_biased = applyLangBias(double(tmp_cost), viewpoint_hs[i]);
+          if (cost_biased < focus_min_cost) {
+            focus_min_cost = cost_biased;
+            focus_min_id = i;
+          }
+        }
+        if (focus_min_id >= 0) {
+          min_cost_id = focus_min_id;
         }
       }
 
@@ -1055,6 +1166,25 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
       ed_->refined_ids_.push_back(frontier_ids[i]);
       if ((tmp - pos).norm() > ep_->refined_radius_ && ed_->refined_ids_.size() >= 2)
         break;
+    }
+
+    if (langFocusActive() && !ed_->refined_ids_.empty()) {
+      std::vector<int> focused_ids;
+      double best_h = -std::numeric_limits<double>::infinity();
+      for (int fid : ed_->refined_ids_) {
+        const double h = langBonus(pos, yaw[0], ed_->averages_[fid]);
+        best_h = std::max(best_h, h);
+      }
+      const double keep_th = std::max(lang_focus_min_h_, lang_focus_rel_h_th_ * best_h);
+      for (int fid : ed_->refined_ids_) {
+        const double h = langBonus(pos, yaw[0], ed_->averages_[fid]);
+        if (h >= keep_th) {
+          focused_ids.push_back(fid);
+        }
+      }
+      if (!focused_ids.empty()) {
+        ed_->refined_ids_ = focused_ids;
+      }
     }
 
     // cout << "getViewpointsInfo" << endl;
@@ -1171,38 +1301,147 @@ static inline double wrapToPi(double a) {
     
   }
 
-  double ExplorationManager::langBonus(const Eigen::Vector3d& from_pos,
-                                      double from_yaw,
-                                      const Eigen::Vector3d& to_pos) const {
+  void ExplorationManager::semanticCtrlCb(const std_msgs::Float32MultiArrayConstPtr& msg) {
+    const std::vector<float>& data = msg->data;
+    if (data.size() < 7) {
+      return;
+    }
+    lang_ctrl_mode_ = std::max(0, std::min(2, int(std::round(data[0]))));
+    lang_ctrl_strength_ = std::max(0.0, double(data[1]));
+    lang_ctrl_target_confidence_ = std::max(0.0, std::min(1.0, double(data[2])));
+    lang_ctrl_semantic_urgency_ = std::max(0.0, std::min(1.0, double(data[3])));
+    lang_ctrl_bearing_center_ = double(data[4]);
+    lang_ctrl_bearing_width_ = std::max(0.1, double(data[5]));
+    lang_ctrl_bearing_confidence_ = std::max(0.0, std::min(1.0, double(data[6])));
+    semantic_ctrl_stamp_ = ros::Time::now();
+  }
+
+  double ExplorationManager::langPeakiness() const {
     if (!lang_enable_) return 0.0;
     if (cue_hist_.empty()) return 0.0;
     if ((ros::Time::now() - cue_hist_stamp_).toSec() > lang_timeout_) return 0.0;
 
-    float maxv = 0.f;
-    for (float v : cue_hist_) maxv = std::max(maxv, v);
-    if (maxv < lang_conf_min_) return 0.0;
+    double sumv = 0.0;
+    double maxv = 0.0;
+    for (float v : cue_hist_) {
+      maxv = std::max(maxv, double(v));
+      sumv += std::max(0.0, double(v));
+    }
+    if (sumv < 1e-6) return 0.0;
+    return maxv / sumv;
+  }
 
-    const int N = (int)cue_hist_.size();
+  bool ExplorationManager::langCtrlFresh() const {
+    if (!lang_enable_) return false;
+    if (semantic_ctrl_stamp_.isZero()) return false;
+    return (ros::Time::now() - semantic_ctrl_stamp_).toSec() <= lang_ctrl_timeout_;
+  }
+
+  int ExplorationManager::langEffectiveMode() const {
+    if (!langCtrlFresh()) {
+      return 0;
+    }
+    return std::max(0, std::min(2, lang_ctrl_mode_));
+  }
+
+  double ExplorationManager::langCtrlScale() const {
+    if (!langCtrlFresh()) {
+      return 1.0;
+    }
+    const double strength = std::max(0.0, std::min(2.5, lang_ctrl_strength_));
+    const double conf = std::max(0.0, std::min(1.0, lang_ctrl_target_confidence_));
+    const double urgency = std::max(0.0, std::min(1.0, lang_ctrl_semantic_urgency_));
+    return 0.75 + 0.55 * strength + 0.35 * conf + 0.45 * urgency;
+  }
+
+  double ExplorationManager::langBearingPriorBonus(const Eigen::Vector3d& from_pos,
+                                                   double from_yaw,
+                                                   const Eigen::Vector3d& to_pos) const {
+    if (!langCtrlFresh()) return 0.0;
+    if (lang_ctrl_bearing_confidence_ <= 1e-6) return 0.0;
 
     const double dx = to_pos.x() - from_pos.x();
     const double dy = to_pos.y() - from_pos.y();
-    double bearing_world = std::atan2(dy, dx);
-    double bearing_body  = wrapToPi(bearing_world - from_yaw);
+    const double bearing_world = std::atan2(dy, dx);
+    const double bearing_body = wrapToPi(bearing_world - from_yaw);
+    const double err = wrapToPi(bearing_body - lang_ctrl_bearing_center_);
+    const double sigma = std::max(0.12, lang_ctrl_bearing_width_);
+    const double gaussian = std::exp(-0.5 * (err * err) / (sigma * sigma));
+    return std::max(0.0, std::min(1.0, lang_ctrl_bearing_confidence_ * gaussian));
+  }
 
-    double u = (bearing_body + M_PI) / (2.0 * M_PI);
-    int bin = (int)std::floor(u * N);
-    if (bin < 0) bin = 0;
-    if (bin >= N) bin = N - 1;
+  bool ExplorationManager::langFocusActive() const {
+    if (langCtrlFresh()) {
+      if (langEffectiveMode() >= 2) return true;
+      if (langEffectiveMode() == 1) {
+        return lang_ctrl_target_confidence_ >= lang_ctrl_focus_conf_th_ &&
+               lang_ctrl_semantic_urgency_ >= lang_ctrl_focus_urgency_th_;
+      }
+      return false;
+    }
+    return langPeakiness() >= lang_focus_peakiness_th_;
+  }
 
-    float v = cue_hist_[bin];
-    for (int k = 1; k <= lang_smooth_win_; ++k) {
-      int b1 = (bin + k) % N;
-      int b2 = (bin - k + N) % N;
-      v = std::max(v, cue_hist_[b1]);
-      v = std::max(v, cue_hist_[b2]);
+  double ExplorationManager::applyLangBias(double raw_cost, double h) const {
+    double biased = raw_cost;
+    if (!(lang_enable_ && lang_beta_ > 1e-9)) return biased;
+
+    const double beta = lang_beta_ * langCtrlScale();
+    biased -= beta * h;
+
+    if (langFocusActive()) {
+      if (h < lang_focus_min_h_) {
+        biased += lang_focus_penalty_ * (lang_focus_min_h_ - h);
+      } else {
+        biased -= lang_focus_bonus_ * h;
+      }
+    }
+    return biased;
+  }
+
+  double ExplorationManager::langBonus(const Eigen::Vector3d& from_pos,
+                                      double from_yaw,
+                                      const Eigen::Vector3d& to_pos) const {
+    if (!lang_enable_) return 0.0;
+    if (langCtrlFresh() && langEffectiveMode() == 0) return 0.0;
+
+    double hist_h = 0.0;
+    if (!cue_hist_.empty() && (ros::Time::now() - cue_hist_stamp_).toSec() <= lang_timeout_) {
+      float maxv = 0.f;
+      for (float v : cue_hist_) maxv = std::max(maxv, v);
+      if (maxv >= lang_conf_min_) {
+        const int N = (int)cue_hist_.size();
+
+        const double dx = to_pos.x() - from_pos.x();
+        const double dy = to_pos.y() - from_pos.y();
+        double bearing_world = std::atan2(dy, dx);
+        double bearing_body  = wrapToPi(bearing_world - from_yaw);
+
+        double u = (bearing_body + M_PI) / (2.0 * M_PI);
+        int bin = (int)std::floor(u * N);
+        if (bin < 0) bin = 0;
+        if (bin >= N) bin = N - 1;
+
+        float v = cue_hist_[bin];
+        for (int k = 1; k <= lang_smooth_win_; ++k) {
+          int b1 = (bin + k) % N;
+          int b2 = (bin - k + N) % N;
+          v = std::max(v, cue_hist_[b1]);
+          v = std::max(v, cue_hist_[b2]);
+        }
+
+        hist_h = (maxv > 1e-6f) ? (double(v) / double(maxv)) : 0.0;
+      }
     }
 
-    double h = (maxv > 1e-6f) ? (double(v) / double(maxv)) : 0.0;  // 0~1
+    const double prior_h = langBearingPriorBonus(from_pos, from_yaw, to_pos);
+    double h = std::max(hist_h, prior_h);
+    if (langCtrlFresh() && langEffectiveMode() > 0) {
+      h = std::min(1.0, h * (0.85 + 0.15 * std::max(0.0, std::min(2.0, lang_ctrl_strength_))));
+      if (langEffectiveMode() >= 2 && prior_h > 0.0) {
+        h = std::max(h, std::min(1.0, prior_h + lang_ctrl_bearing_bonus_ * lang_ctrl_bearing_confidence_));
+      }
+    }
     return h;
   }
 

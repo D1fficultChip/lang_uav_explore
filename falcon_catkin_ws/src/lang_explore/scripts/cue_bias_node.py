@@ -18,15 +18,23 @@ class CueBiasNode:
         self.req_json = rospy.get_param("~perception_request_json", "/shared/perception_request.json")
 
         # ---- Topics ----
-        self.odom_topic = rospy.get_param("~odom_topic", "/uav_simulator/odometry")
+        self.odom_topic = rospy.get_param("~odom_topic", "/ekf/ekf_odom")
         self.pub_topic = rospy.get_param("~pub_topic", "/lang/cue_hist")
+        self.ctrl_topic = rospy.get_param("~ctrl_topic", "/lang/semantic_ctrl")
 
         # ---- Params ----
-        self.bins = int(rospy.get_param("~bins", 36))
+        self.bins = int(rospy.get_param("~bins", 8))
         self.hfov_deg = float(rospy.get_param("~hfov_deg", 90.0))
         self.decay = float(rospy.get_param("~decay", 0.98))      # per second
         self.score_th = float(rospy.get_param("~score_th", 0.5)) # cue 触发阈值
         self.pub_rate = float(rospy.get_param("~pub_rate", 10.0))
+        self.default_semantic_mode = str(rospy.get_param("~default_semantic_mode", "bias")).strip().lower()
+        self.default_semantic_strength = float(rospy.get_param("~default_semantic_strength", 0.8))
+        self.focus_other_decay = float(rospy.get_param("~focus_other_decay", 0.35))
+        self.focus_neighbor_gain = float(rospy.get_param("~focus_neighbor_gain", 0.35))
+        self.focus_peak_gain = float(rospy.get_param("~focus_peak_gain", 2.0))
+        self.bias_neighbor_gain = float(rospy.get_param("~bias_neighbor_gain", 0.18))
+        self.bias_peak_gain = float(rospy.get_param("~bias_peak_gain", 0.8))
 
         # NEW: gating
         self.gate_by_req = bool(rospy.get_param("~gate_by_req", True))
@@ -43,9 +51,15 @@ class CueBiasNode:
         # NEW: current request context
         self.current_req_id = None
         self.allowed_cue_entities = None  # None means "unknown/no gate"
+        self.semantic_mode = self.default_semantic_mode
+        self.semantic_strength = self.default_semantic_strength
+        self.target_confidence = 0.0
+        self.semantic_urgency = 0.0
+        self.bearing_prior = {}
 
         rospy.Subscriber(self.odom_topic, Odometry, self.cb_odom, queue_size=50)
         self.pub = rospy.Publisher(self.pub_topic, Float32MultiArray, queue_size=10)
+        self.ctrl_pub = rospy.Publisher(self.ctrl_topic, Float32MultiArray, queue_size=10)
         rospy.Timer(rospy.Duration(1.0 / max(1e-6, self.pub_rate)), self.on_timer)
 
     def cb_odom(self, msg):
@@ -65,7 +79,10 @@ class CueBiasNode:
         now = time.time()
         dt = max(0.0, now - self.last_t)
         self.last_t = now
-        factor = self.decay ** dt
+        decay = self.decay
+        if self.semantic_mode == "focus":
+            decay = min(0.995, max(self.decay, 0.985))
+        factor = decay ** dt
         for i in range(self.bins):
             self.H[i] *= factor
 
@@ -75,6 +92,11 @@ class CueBiasNode:
             # No request file -> degrade gracefully (no gating)
             self.current_req_id = None
             self.allowed_cue_entities = None
+            self.semantic_mode = "normal"
+            self.semantic_strength = 0.0
+            self.target_confidence = 0.0
+            self.semantic_urgency = 0.0
+            self.bearing_prior = {}
             return
 
         try:
@@ -110,6 +132,88 @@ class CueBiasNode:
             self.allowed_cue_entities = allowed
         else:
             self.allowed_cue_entities = []
+
+        extra = d.get("extra", {})
+        if isinstance(extra, dict):
+            mode = str(extra.get("semantic_mode", self.default_semantic_mode)).strip().lower()
+            if mode not in ("normal", "bias", "focus", "off"):
+                mode = self.default_semantic_mode
+            self.semantic_mode = mode
+            try:
+                self.semantic_strength = float(extra.get("semantic_strength", self.default_semantic_strength))
+            except Exception:
+                self.semantic_strength = self.default_semantic_strength
+            try:
+                self.target_confidence = float(extra.get("target_confidence", 0.0))
+            except Exception:
+                self.target_confidence = 0.0
+            try:
+                self.semantic_urgency = float(extra.get("semantic_urgency", 0.0))
+            except Exception:
+                self.semantic_urgency = 0.0
+            bearing_prior = extra.get("bearing_prior", {})
+            self.bearing_prior = bearing_prior if isinstance(bearing_prior, dict) else {}
+        else:
+            self.semantic_mode = self.default_semantic_mode
+            self.semantic_strength = self.default_semantic_strength
+            self.target_confidence = 0.0
+            self.semantic_urgency = 0.0
+            self.bearing_prior = {}
+
+    def _mode_code(self):
+        if self.semantic_mode == "focus":
+            return 2.0
+        if self.semantic_mode == "bias":
+            return 1.0
+        return 0.0
+
+    def _bearing_prior_ctrl(self):
+        if not isinstance(self.bearing_prior, dict):
+            return 0.0, 0.0, 0.0
+
+        conf = self.bearing_prior.get("confidence", 0.0)
+        try:
+            conf = max(0.0, min(1.0, float(conf)))
+        except Exception:
+            conf = 0.0
+
+        yaw_center = self.bearing_prior.get("yaw_center")
+        yaw_width = self.bearing_prior.get("yaw_width")
+        if yaw_center is not None and yaw_width is not None:
+            try:
+                return float(yaw_center), max(0.1, float(yaw_width)), conf
+            except Exception:
+                pass
+
+        center_norm = self.bearing_prior.get("center_x_norm")
+        width_norm = self.bearing_prior.get("width_x_norm")
+        try:
+            center_norm = float(center_norm)
+            width_norm = float(width_norm) if width_norm is not None else 0.25
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+        center_norm = max(0.0, min(1.0, center_norm))
+        width_norm = max(0.05, min(1.0, width_norm))
+        hfov_rad = math.radians(self.hfov_deg)
+        yaw_center = (center_norm - 0.5) * hfov_rad
+        yaw_width = max(0.12, width_norm * hfov_rad)
+        return yaw_center, yaw_width, conf
+
+    def publish_semantic_ctrl(self):
+        yaw_center, yaw_width, bearing_conf = self._bearing_prior_ctrl()
+        msg = Float32MultiArray(
+            data=[
+                float(self._mode_code()),
+                float(max(0.0, self.semantic_strength)),
+                float(max(0.0, min(1.0, self.target_confidence))),
+                float(max(0.0, min(1.0, self.semantic_urgency))),
+                float(yaw_center),
+                float(yaw_width),
+                float(max(0.0, min(1.0, bearing_conf))),
+            ]
+        )
+        self.ctrl_pub.publish(msg)
 
     # ---------------- read infer_cue.json and update hist ----------------
     def update_from_file(self):
@@ -161,6 +265,9 @@ class CueBiasNode:
                 # request says cues empty -> ignore all cue updates
                 return
 
+        if self.semantic_mode in ("off", "normal"):
+            return
+
         # old gates
         if not d.get("found", False):
             return
@@ -189,7 +296,26 @@ class CueBiasNode:
         yaw_cue = wrap_pi(yaw + delta)
 
         k = self.yaw_to_bin(yaw_cue)
-        self.H[k] += score
+        strength = max(0.0, min(3.0, float(self.semantic_strength)))
+
+        if self.semantic_mode == "focus":
+            keep = max(0.0, min(1.0, self.focus_other_decay))
+            for i in range(self.bins):
+                self.H[i] *= keep
+            peak_gain = 1.0 + self.focus_peak_gain * max(0.5, strength)
+            neigh_gain = self.focus_neighbor_gain * max(0.5, strength)
+            self.H[k] += score * peak_gain
+            if self.bins > 1:
+                self.H[(k + 1) % self.bins] += score * neigh_gain
+                self.H[(k - 1 + self.bins) % self.bins] += score * neigh_gain
+            return
+
+        peak_gain = 1.0 + self.bias_peak_gain * strength
+        neigh_gain = self.bias_neighbor_gain * strength
+        self.H[k] += score * peak_gain
+        if self.bins > 1 and neigh_gain > 1e-6:
+            self.H[(k + 1) % self.bins] += score * neigh_gain
+            self.H[(k - 1 + self.bins) % self.bins] += score * neigh_gain
 
     def on_timer(self, _):
         # NEW: keep request context fresh
@@ -198,6 +324,7 @@ class CueBiasNode:
         self.decay_hist()
         self.update_from_file()
         self.pub.publish(Float32MultiArray(data=self.H))
+        self.publish_semantic_ctrl()
 
 if __name__ == "__main__":
     rospy.init_node("cue_bias_node")

@@ -7,7 +7,8 @@ import cv2
 
 class FrameDumper:
     def __init__(self):
-        self.image_topic = rospy.get_param("~image_topic", "/camera/image_raw")
+        self.image_topic = rospy.get_param("~image_topic", "/camera/color/image_raw")
+        # self.image_topic = rospy.get_param("~image_topic", "/camera/image_raw")
         self.out_dir = rospy.get_param("~out_dir", "/shared")
         self.rate_hz = float(rospy.get_param("~rate_hz", 5.0))
         self.jpeg_quality = int(rospy.get_param("~jpeg_quality", 90))
@@ -25,7 +26,7 @@ class FrameDumper:
     def cb(self, msg: Image):
         try:
             # most sims publish bgr8/rgb8; cv_bridge handles both if encoding is set
-            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.latest = cv_img
             self.latest_stamp = msg.header.stamp.to_sec()
         except Exception as e:

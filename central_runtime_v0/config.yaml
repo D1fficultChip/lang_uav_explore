@@ -7,11 +7,14 @@ shared_dir: /home/young/uav_demo/shared
 
 # shared 内的相对文件名
 infer_json: infer.json
+infer_cue_json: infer_cue.json
+target_localization_json: target_localization.json
 prompt_txt: prompt.txt
 
 # ====== runtime loop & logging ======
 tick_hz: 10.0
 log_jsonl_path: plan_runtime.jsonl
+event_jsonl_path: runtime_events.jsonl
 
 # ====== stage gating / settle ======
 # 进入阶段/切换后给系统一点稳定时间（你也可以配合 HOLD 使用）
@@ -28,72 +31,131 @@ cues_txt: cues.txt
 # ====== NEW: mux / hover (推荐启用) ======
 # central_runtime 在阶段切换时先选 HOLD 悬停，再切到目标算法通道
 mux:
-  select_service: /mux/select
+  select_service: /cmd_mux/select
   hold_topic: /hold/pos_cmd
-  selected_topic: /mux/selected
-
-  # 悬停缓冲时间（切换前/后给飞机“稳一下”）
+  selected_topic: /cmd_mux/selected
   pre_switch_hover_s: 0.3
-
-  # 用于“定位是否稳定/新鲜”的基础判据（如果你在 executor 里做了 wait_odom_fresh）
-  odom_topic: /uav_simulator/odometry
+  odom_topic: /ekf/ekf_odom
   odom_max_age_s: 0.3
   odom_wait_timeout_s: 2.0
-
-  # intent -> 控制源 topic（V1 常驻：两个算法都可常驻跑，只靠 mux 切）
   intent_source:
     SEARCH: /falcon/pos_cmd
     NAVIGATE: /ego/pos_cmd
-    TRACK: /falcon/pos_cmd
-
-# ====== NEW: NAVIGATE goal publish (由 central_runtime 发布 PoseStamped) ======
-# 默认目标点发布话题（必须与你的 EGO 订阅一致；你现在 rviz 点就是这个）
+    OBSERVE: /ego/pos_cmd
+    TRACK: /ego/pos_cmd
 ego_goal_topic: /move_base_simple/goal
-
-# entity -> goal 的 V0 版本：先用固定点跑通“中枢->EGO->到达”
-# 后续你可以把 goal 改成从 entity.extra 或 bbox->3D 解析出来，但接口不变
 entity_goals:
   E_safe_exit:
-    frame: "world"
-    x: -14.0
-    y: -14.0
-    z: 1.0
+    frame: world
+    x: -1.79
+    y: 1.95
+    z: 1.6
     yaw_deg: 0.0
-
-# =========================
-# Adapters: 负责“启动/停止算法容器内 roslaunch”
-# =========================
 adapters:
   SEARCH:
-    container: falcon_noetic
-    cmd: ["bash","-lc",
-          "source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash && roslaunch exploration_manager exploration.launch map_name:=complex_office_2"]
-    pidfile: "/shared/falcon_search.pid"
-    logfile: "/shared/falcon_search.log"
-    stop_pattern: "roslaunch exploration_manager exploration.launch"
-
+    container: "ssh:nv@192.168.43.7"
+    cmd:
+      - /home/nv/uav_demo/start_exploration.sh
+    pidfile: /home/nv/uav_demo/src/shared/falcon_search.pid
+    logfile: /home/nv/uav_demo/src/shared/falcon_search.log
+    stop_pattern: roslaunch exploration_manager exploration.launch
   NAVIGATE:
-    container: ego_noetic
-    # 容器内要执行的 roslaunch 命令本体（是否需要 source 取决于你的 adapter 实现）
-    cmd: ["bash","-lc",
-          "source /opt/ros/noetic/setup.bash && source ~/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch"]
-    pidfile: "/shared/ego_nav.pid"
-    logfile: "/shared/ego_nav.log"
-    stop_pattern: "roslaunch ego_planner"
+    container: "ssh:nv@192.168.43.7"
+    cmd:
+      - /home/nv/uav_demo/start_track.sh
+    pidfile: /home/nv/uav_demo/src/shared/ego_nav.pid
+    logfile: /home/nv/uav_demo/src/shared/ego_nav.log 
+    stop_pattern: roslaunch ego_planner
     publish_goal_once: false
-    # 下面这些保留为“兼容/备用”，真正发布 goal 建议由 central_runtime 用 ego_goal_topic 统一做
-    goal_topic: "/move_base_simple/goal"
+    goal_topic: /move_base_simple/goal
     startup_sleep_s: 0.5
-    
 verified:
-  # VERIFIED 的最小“导航/执行时间”门槛（秒）
   min_navigate_time_s: 2.0
-
-  # 是否必须“看到一次目标”才算 VERIFIED
   require_found: true
-
-  # 看到一次目标的最低分数门槛
   min_score: 0.5
-
-  # VISIBLE_FOR 的默认分数门槛（可选）
   visible_min_score: 0.5
+
+intent_alias:
+  INSPECT: TRACK
+
+world_state:
+  obs_ttl_s: 1.0
+  cue_ttl_s: 2.0
+  max_recent_evidence: 20
+
+verification:
+  require_req_match: true
+  require_entity_match: true
+  require_primary_role: true
+  stable_hits_for_verify: 2
+  max_detection_age_s: 1.0
+  min_score: 0.5
+  min_mask_quality: 0.55
+  max_ambiguous_top2_gap: 0.08
+  min_motion_progress_m: 0.3
+  nav_stall_timeout_s: 5.0
+  nav_goal_reached_tol_m: 0.8
+  nav_progress_check_period_s: 1.0
+
+diagnostics:
+  max_events: 50
+
+recovery:
+  max_retries_per_stage: 2
+  hold_reobserve_s: 2.0
+  allow_fallback_to_search: true
+
+reasoner:
+  enabled: false
+  backend: noop
+  base_url: https://api.openai.com/v1/chat/completions
+  model: ""
+  api_key_env: OPENAI_API_KEY
+  timeout_s: 20.0
+  temperature: 0.1
+  min_stage_dwell_s: 2.0
+  cooldown_s: 3.0
+  verify_window_s: 2.0
+  max_recent_events: 20
+  trigger_on_inconclusive: true
+  auto_rewrite_request: true
+  allow_actions:
+    - continue
+    - retry_same_stage
+    - hold_and_reobserve
+    - switch_cue_priority
+    - insert_verify_stage
+    - fallback_to_search
+    - safe_terminate
+  auto_apply_actions:
+    - retry_same_stage
+    - hold_and_reobserve
+    - switch_cue_priority
+    - fallback_to_search
+    - safe_terminate
+  allow_insert_verify_stage: false
+  allow_unknown_target_stage: false
+
+semantic_verifier:
+  enabled: true
+  backend: api
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  model: qwen-plus
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 20.0
+  temperature: 0.1
+  include_image: false
+  min_stage_dwell_s: 1.5
+  cooldown_s: 4.0
+  trigger_on_ambiguous: true
+  trigger_on_inconclusive: true
+  trigger_on_relations: true
+  trigger_on_failure: false
+  auto_apply_followup: true
+  allow_followups:
+    - continue
+    - hold_and_reobserve
+    - retry_same_stage
+    - insert_verify_stage
+    - switch_cue_priority
+    - fallback_to_search

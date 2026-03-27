@@ -70,8 +70,10 @@ private:
 int lang_topk_ = 8;
 
 ros::Subscriber cue_hist_sub_;
+ros::Subscriber semantic_ctrl_sub_;
 std::vector<float> cue_hist_;
 ros::Time cue_hist_stamp_;
+ros::Time semantic_ctrl_stamp_;
 
 bool lang_enable_ = false;
 double lang_beta_ = 0.0;
@@ -79,12 +81,40 @@ double lang_timeout_ = 0.5;
 double lang_conf_min_ = 0.0;
 int lang_smooth_win_ = 1;
 bool lang_debug_ = false;
+double lang_focus_peakiness_th_ = 0.45;
+double lang_focus_min_h_ = 0.65;
+double lang_focus_rel_h_th_ = 0.85;
+double lang_focus_viewpoint_min_h_ = 0.60;
+double lang_focus_penalty_ = 30.0;
+double lang_focus_bonus_ = 10.0;
+double lang_ctrl_timeout_ = 1.0;
+double lang_ctrl_focus_conf_th_ = 0.45;
+double lang_ctrl_focus_urgency_th_ = 0.55;
+double lang_ctrl_bearing_bonus_ = 0.35;
+
+int lang_ctrl_mode_ = 0;
+double lang_ctrl_strength_ = 0.0;
+double lang_ctrl_target_confidence_ = 0.0;
+double lang_ctrl_semantic_urgency_ = 0.0;
+double lang_ctrl_bearing_center_ = 0.0;
+double lang_ctrl_bearing_width_ = 0.0;
+double lang_ctrl_bearing_confidence_ = 0.0;
 
 // 声明两个函数（放在 private: 或 public: 均可，但一般 private）
 void cueHistCb(const std_msgs::Float32MultiArrayConstPtr& msg);
+void semanticCtrlCb(const std_msgs::Float32MultiArrayConstPtr& msg);
 double langBonus(const Eigen::Vector3d& from_pos,
                  double from_yaw,
                  const Eigen::Vector3d& to_pos) const;
+double langPeakiness() const;
+bool langCtrlFresh() const;
+int langEffectiveMode() const;
+double langCtrlScale() const;
+double langBearingPriorBonus(const Eigen::Vector3d& from_pos,
+                             double from_yaw,
+                             const Eigen::Vector3d& to_pos) const;
+bool langFocusActive() const;
+double applyLangBias(double raw_cost, double h) const;
 
   shared_ptr<EDTEnvironment> edt_environment_;
   voxel_mapping::MapServer::Ptr map_server_;

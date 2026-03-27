@@ -1,0 +1,790 @@
+diff --git a/infer_loop_vis_guide.py b/infer_loop_vis_guide.py
+old mode 100644
+new mode 100755
+index c194f96..fc2621b
+--- a/infer_loop_vis_guide.py
++++ b/infer_loop_vis_guide.py
+@@ -3,6 +3,7 @@ import numpy as np
+ import cv2
+ import torch
+ from pathlib import Path
++from contextlib import nullcontext
+ 
+ from sam2.build_sam import build_sam2
+ from sam2.sam2_image_predictor import SAM2ImagePredictor
+@@ -16,19 +17,24 @@ from torchvision.ops import box_convert
+ # Paths (match your ROS nodes)
+ # =========================
+ SHARED = Path("/shared")
+-FRAME_PATH = SHARED / "frame.jpg"          # written by frame_dumper.py
+-PROMPT_PATH = SHARED / "prompt.txt"        # written by prompt_writer.py
++FRAME_PATH = SHARED / "frame.jpg"
++FRAME_META_PATH = SHARED / "frame_meta.json"
++PROMPT_PATH = SHARED / "prompt.txt"
++
++# NEW: central_runtime writes this (structured targets)
++REQ_PATH = SHARED / "perception_request.json"
+ 
+ # Primary outputs (keep SAME for json_publisher.py compatibility)
+-OUT_PATH = SHARED / "infer.json"           # watched by json_publisher.py
++OUT_PATH = SHARED / "infer.json"
+ VIS_PATH = SHARED / "infer_vis.jpg"
++MASK_PATH = SHARED / "infer_mask.png"
+ 
+-# Cue outputs (NEW for M3-lite)
+-CUES_PATH = SHARED / "cues.txt"            # optional: one cue per line
++# Cue outputs
++CUES_PATH = SHARED / "cues.txt"
+ OUT_CUE_PATH = SHARED / "infer_cue.json"
+ CUE_VIS_PATH = SHARED / "infer_cue_vis.jpg"
+ 
+-MASK_ALPHA = 0.40  # primary mask overlay alpha
++MASK_ALPHA = 0.40
+ 
+ 
+ # =========================
+@@ -36,26 +42,40 @@ MASK_ALPHA = 0.40  # primary mask overlay alpha
+ # =========================
+ SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_tiny.pt"
+ SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+-GDINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+-GDINO_CKPT = "gdino_checkpoints/groundingdino_swint_ogc.pth"
++GDINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py"
++GDINO_CKPT = "gdino_checkpoints/groundingdino_swinb_cogcoor.pth"
+ 
+ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ 
++# =========================
++# FP16 / AMP
++# =========================
++USE_FP16 = True
++AMP_ENABLED = (DEVICE == "cuda" and USE_FP16)
++
++def amp_ctx():
++    if AMP_ENABLED:
++        return torch.autocast(device_type="cuda", dtype=torch.float16)
++    return nullcontext()
++
+ 
+ # =========================
+ # Thresholds
+ # =========================
+-# Primary (your original)
+ BOX_THRESHOLD = 0.5
+ TEXT_THRESHOLD = 0.5
+ 
+-# Cue (M3-lite): recommend a bit lower because cues are "weak hints"
+ CUE_BOX_THRESHOLD = 0.35
+ CUE_TEXT_THRESHOLD = 0.35
+-CUE_CONF_THRESHOLD = 0.60   # only when >= this will cue_out["found"]=True
++CUE_CONF_THRESHOLD = 0.70
+ 
+-# Cue schedule
+-CUE_PERIOD_S = 0.5          # 0.5Hz cue check (primary still runs every new frame)
++# Cue schedule: run ONE cue per period (round robin)
++CUE_PERIOD_S = 0.2
++TOPK_PRIMARY = 3
++TOPK_CUE = 3
++PRIMARY_AMBIGUOUS_GAP = 0.08
++CUE_AMBIGUOUS_GAP = 0.08
++MASK_QUALITY_LOW = 0.55
+ 
+ 
+ # =========================
+@@ -69,11 +89,26 @@ def atomic_json(path: Path, obj):
+ 
+ def atomic_imwrite(path: Path, img_bgr, params=None):
+     suffix = path.suffix if path.suffix else ".jpg"
+-    tmp_path = path.with_suffix(".tmp" + suffix)  # e.g. infer_vis.tmp.jpg
++    tmp_path = path.with_suffix(".tmp" + suffix)
+     ok = cv2.imwrite(str(tmp_path), img_bgr, params or [])
+     if ok:
+         os.replace(str(tmp_path), str(path))
+ 
++def read_frame_stamp():
++    if not FRAME_META_PATH.exists():
++        return None
++    try:
++        obj = json.loads(FRAME_META_PATH.read_text())
++    except Exception:
++        return None
++    if not isinstance(obj, dict):
++        return None
++    stamp = obj.get("stamp")
++    try:
++        return float(stamp) if stamp is not None else None
++    except Exception:
++        return None
++
+ def normalize_prompt(t: str) -> str:
+     t = (t or "").strip().lower()
+     if not t:
+@@ -82,18 +117,13 @@ def normalize_prompt(t: str) -> str:
+         t += "."
+     return t
+ 
+-def read_prompt_primary():
+-    # prompt_writer.py already writes lowercase + '.' ending, but we keep safe.
++def read_prompt_primary_fallback():
+     if not PROMPT_PATH.exists():
+         return "car."
+     t = PROMPT_PATH.read_text().strip()
+     return normalize_prompt(t)
+ 
+-def read_cues():
+-    """
+-    /shared/cues.txt (optional), one cue per line:
+-      exit sign
+-    """
++def read_cues_fallback():
+     if not CUES_PATH.exists():
+         return ["exit sign."]
+     lines = [l.strip() for l in CUES_PATH.read_text().splitlines()]
+@@ -104,47 +134,79 @@ def read_cues():
+         cues.append(normalize_prompt(l))
+     return cues if cues else ["exit sign."]
+ 
++def read_perception_request_cached(last_mtime: float, cache: dict):
++    """
++    Returns (new_mtime, req_dict_or_cache)
++
++    req format (written by central_runtime):
++      {
++        "req_id": 7,
++        "stage_id": "S1",
++        "primary": {"entity_id":"E_car","prompt":"car."},
++        "cues": [{"entity_id":"E_exit","prompt":"safe exit."}]
++      }
++    """
++    if not REQ_PATH.exists():
++        return last_mtime, cache
++
++    try:
++        m = REQ_PATH.stat().st_mtime
++    except Exception:
++        return last_mtime, cache
++
++    if m <= last_mtime:
++        return last_mtime, cache
++
++    try:
++        raw = REQ_PATH.read_text()
++        obj = json.loads(raw)
++        if not isinstance(obj, dict):
++            return last_mtime, cache
++        # minimal validation
++        if "primary" not in obj or not isinstance(obj["primary"], dict):
++            return last_mtime, cache
++        return m, obj
++    except Exception:
++        # If central_runtime is in the middle of atomic replace, json may be transiently invalid.
++        return last_mtime, cache
++
+ def overlay_masks(img_bgr, masks, best_idx=None, alpha=0.4):
+     if masks is None:
+         return img_bgr
+-
+     vis = img_bgr.copy()
+     h, w = vis.shape[:2]
+     overlay = vis.copy()
+ 
+-    if masks.ndim == 2:
+-        masks_n = masks[None, ...]
+-    else:
+-        masks_n = masks
+-
++    masks_n = masks[None, ...] if masks.ndim == 2 else masks
+     for i in range(masks_n.shape[0]):
+         m = masks_n[i]
+         if m.dtype != np.bool_:
+             m = m > 0.5
+-
+         if m.shape[0] != h or m.shape[1] != w:
+             m = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+ 
+         color = (0, 255, 0)
+         if best_idx is not None and i == best_idx:
+             color = (0, 0, 255)
+-
+         overlay[m] = color
+ 
+     vis = cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0)
+     return vis
+ 
+-def draw_boxes(img_bgr, boxes_xyxy, labels=None, scores=None, best_idx=None, prompt=None, found=True):
++def draw_boxes(img_bgr, boxes_xyxy, labels=None, scores=None, best_idx=None, prompt=None, found=True, header=None):
+     vis = img_bgr.copy()
+     h, w = vis.shape[:2]
+ 
++    if header:
++        cv2.putText(vis, header, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
++
+     if prompt:
+-        cv2.putText(vis, f"prompt: {prompt}", (10, 28),
+-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
++        cv2.putText(vis, f"prompt: {prompt}", (10, 50),
++                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+ 
+     if not found:
+-        cv2.putText(vis, "NO DETECTION", (10, 60),
+-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
++        cv2.putText(vis, "NO DETECTION", (10, 82),
++                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2, cv2.LINE_AA)
+         return vis
+ 
+     if boxes_xyxy is None or len(boxes_xyxy) == 0:
+@@ -186,9 +248,6 @@ def draw_boxes(img_bgr, boxes_xyxy, labels=None, scores=None, best_idx=None, pro
+     return vis
+ 
+ def pick_best_box_by_conf_area(xyxy_boxes: np.ndarray, conf_list: list):
+-    """
+-    Return best index by conf * sqrt(area) to suppress tiny noisy boxes.
+-    """
+     if xyxy_boxes is None or len(xyxy_boxes) == 0:
+         return None
+     best_i = 0
+@@ -203,6 +262,102 @@ def pick_best_box_by_conf_area(xyxy_boxes: np.ndarray, conf_list: list):
+     return best_i
+ 
+ 
++def _safe_float(v, default=0.0):
++    try:
++        return float(v)
++    except Exception:
++        return float(default)
++
++
++def mask_quality_from_bbox(mask_score: float, bbox_xyxy, img_w: int, img_h: int) -> float:
++    if bbox_xyxy is None or img_w <= 0 or img_h <= 0:
++        return max(0.0, min(1.0, float(mask_score)))
++    x1, y1, x2, y2 = bbox_xyxy
++    box_area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
++    area_ratio = box_area / max(float(img_w * img_h), 1.0)
++    area_term = 1.0 - min(1.0, abs(area_ratio - 0.10) / 0.10)
++    quality = 0.7 * _safe_float(mask_score) + 0.3 * max(0.0, area_term)
++    return max(0.0, min(1.0, quality))
++
++
++def spatial_hint_from_bbox(bbox_xyxy, img_w: int, img_h: int):
++    if bbox_xyxy is None or img_w <= 0 or img_h <= 0:
++        return {}
++    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
++    cx = 0.5 * (x1 + x2)
++    cy = 0.5 * (y1 + y2)
++    cx_n = max(0.0, min(1.0, cx / float(img_w)))
++    cy_n = max(0.0, min(1.0, cy / float(img_h)))
++    area_ratio = max(0.0, min(1.0, ((x2 - x1) * (y2 - y1)) / max(float(img_w * img_h), 1.0)))
++
++    if cx_n < 0.33:
++        x_bucket = "left"
++    elif cx_n > 0.67:
++        x_bucket = "right"
++    else:
++        x_bucket = "center"
++
++    if cy_n < 0.33:
++        y_bucket = "top"
++    elif cy_n > 0.67:
++        y_bucket = "bottom"
++    else:
++        y_bucket = "center"
++
++    return {
++        "image_region": f"{x_bucket}_{y_bucket}",
++        "center_xy_norm": [cx_n, cy_n],
++        "box_area_ratio": area_ratio,
++    }
++
++
++def proposal_status_from_candidates(candidates, *, ambiguous_gap: float, low_quality_flag: bool) -> str:
++    if not candidates:
++        return "no_candidate"
++    top1 = _safe_float(candidates[0].get("score", 0.0))
++    if top1 <= 0.0:
++        return "low_confidence"
++    if len(candidates) >= 2:
++        top2 = _safe_float(candidates[1].get("score", 0.0))
++        if abs(top1 - top2) < ambiguous_gap:
++            return "multi_candidate_ambiguous"
++    if low_quality_flag:
++        return "low_confidence"
++    if len(candidates) == 1:
++        return "single_candidate"
++    return "stable_primary_candidate"
++
++
++def uncertainty_from_candidates(candidates, *, low_mask_confidence: bool):
++    if not candidates:
++        return {
++            "multi_candidate": False,
++            "ambiguous_top2_gap": None,
++            "low_mask_confidence": low_mask_confidence,
++        }
++    gap = None
++    if len(candidates) >= 2:
++        gap = max(0.0, _safe_float(candidates[0].get("score", 0.0)) - _safe_float(candidates[1].get("score", 0.0)))
++    return {
++        "multi_candidate": len(candidates) > 1,
++        "ambiguous_top2_gap": gap,
++        "low_mask_confidence": bool(low_mask_confidence),
++    }
++
++def best_binary_mask(masks, best_idx: int, img_w: int, img_h: int):
++    if masks is None:
++        return None
++    masks_n = masks[None, ...] if masks.ndim == 2 else masks
++    if best_idx < 0 or best_idx >= masks_n.shape[0]:
++        return None
++    m = masks_n[best_idx]
++    if m.dtype != np.bool_:
++        m = m > 0.5
++    if m.shape[0] != img_h or m.shape[1] != img_w:
++        m = cv2.resize(m.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST).astype(bool)
++    return (m.astype(np.uint8) * 255)
++
++
+ # =========================
+ # Main
+ # =========================
+@@ -210,79 +365,142 @@ def main():
+     sam2_model = build_sam2(SAM2_MODEL_CONFIG, SAM2_CHECKPOINT, device=DEVICE)
+     sam2_predictor = SAM2ImagePredictor(sam2_model)
+     grounding_model = load_model(GDINO_CONFIG, GDINO_CKPT, device=DEVICE)
++    sam2_model.eval()
++    grounding_model.eval()
+ 
+-    last_mtime = 0.0
++    print(f"[infer_loop] AMP FP16 enabled: {AMP_ENABLED} (device={DEVICE})")
++    print(f"[infer_loop] watching {FRAME_PATH} + request={REQ_PATH} (fallback prompt={PROMPT_PATH})")
++    print(f"[infer_loop] primary -> {OUT_PATH}, vis -> {VIS_PATH}")
++    print(f"[infer_loop] cue -> {OUT_CUE_PATH}, cue_vis -> {CUE_VIS_PATH} (fallback cues={CUES_PATH})")
++
++    last_frame_mtime = 0.0
+     last_cue_t = 0.0
+-    cue_idx = 0
+ 
+-    print(f"[infer_loop] watching {FRAME_PATH} + {PROMPT_PATH}")
+-    print(f"[infer_loop] primary -> {OUT_PATH}, vis -> {VIS_PATH}")
+-    print(f"[infer_loop] cue -> {OUT_CUE_PATH}, cue_vis -> {CUE_VIS_PATH}, cues file -> {CUES_PATH} (optional)")
++    req_cache = {}
++    req_mtime = 0.0
++
++    cue_idx = 0
++    last_cue_key = None  # detect cue list change
+ 
+     while True:
+         if not FRAME_PATH.exists():
+             time.sleep(0.1)
+             continue
+ 
+-        # Only process when new frame arrives (frame_dumper uses atomic replace)
++        # Only process when new frame arrives
+         mtime = FRAME_PATH.stat().st_mtime
+-        if mtime <= last_mtime:
++        if mtime <= last_frame_mtime:
+             time.sleep(0.03)
+             continue
+-        last_mtime = mtime
++        last_frame_mtime = mtime
++
++        # Update request cache if changed
++        req_mtime, req_cache = read_perception_request_cached(req_mtime, req_cache)
++
++        # Resolve PRIMARY + CUES (request preferred)
++        req_id = None
++        stage_id = None
++        primary_entity_id = None
++        prompt_primary = None
++        cues = []  # list of dict: {entity_id, prompt}
+ 
+-        # Read current primary prompt (written by prompt_writer)
+-        prompt_primary = read_prompt_primary()
++        if isinstance(req_cache, dict) and req_cache.get("primary"):
++            try:
++                req_id = int(req_cache.get("req_id")) if req_cache.get("req_id") is not None else None
++            except Exception:
++                req_id = None
++            stage_id = req_cache.get("stage_id")
++
++            prim = req_cache.get("primary", {}) or {}
++            primary_entity_id = prim.get("entity_id")
++            prompt_primary = normalize_prompt(prim.get("prompt", ""))
++
++            cue_list = req_cache.get("cues", []) or []
++            if isinstance(cue_list, list):
++                for c in cue_list:
++                    if isinstance(c, dict):
++                        ceid = c.get("entity_id")
++                        cp = normalize_prompt(c.get("prompt", ""))
++                        if cp:
++                            cues.append({"entity_id": ceid, "prompt": cp})
++
++        # fallbacks
++        if not prompt_primary:
++            prompt_primary = read_prompt_primary_fallback()
++
++        if not cues:
++            # fallback cues (no entity_id in legacy mode)
++            cues_fb = read_cues_fallback()
++            cues = [{"entity_id": None, "prompt": p} for p in cues_fb]
++
++        # Reset cue index if cue list changed
++        cue_key = tuple((c.get("entity_id"), c.get("prompt")) for c in cues)
++        if cue_key != last_cue_key:
++            cue_idx = 0
++            last_cue_key = cue_key
+ 
+         # Read image for visualization (BGR)
+         img_bgr = cv2.imread(str(FRAME_PATH))
+         if img_bgr is None:
+             continue
++        frame_stamp = read_frame_stamp()
+ 
+-        # GroundingDINO helper (loads from disk, returns rgb numpy + torch image)
++        # GDINO helper
+         image_source_rgb, image_tensor = load_image(str(FRAME_PATH))
++        if DEVICE == "cuda":
++            image_tensor = image_tensor.to("cuda", non_blocking=True)
+ 
+         # -------------------------
+         # PRIMARY: GDINO -> SAM2
+         # -------------------------
+         sam2_predictor.set_image(image_source_rgb)
+ 
+-        boxes, confidences, labels = predict(
+-            model=grounding_model,
+-            image=image_tensor,
+-            caption=prompt_primary,
+-            box_threshold=BOX_THRESHOLD,
+-            text_threshold=TEXT_THRESHOLD,
+-        )
++        with torch.inference_mode(), amp_ctx():
++            boxes, confidences, labels = predict(
++                model=grounding_model,
++                image=image_tensor,
++                caption=prompt_primary,
++                box_threshold=BOX_THRESHOLD,
++                text_threshold=TEXT_THRESHOLD,
++            )
+ 
+         found = False
+         best = {"score": 0.0, "bbox": None, "class_name": None}
+-
+-        # Default vis when no detection
+-        vis_img = draw_boxes(img_bgr, boxes_xyxy=None, prompt=prompt_primary, found=False)
++        proposal_status = "no_candidate"
++        topk_candidates = []
++        spatial_hint = {}
++        proposal_uncertainty = {
++            "multi_candidate": False,
++            "ambiguous_top2_gap": None,
++            "low_mask_confidence": False,
++        }
++        best_mask_quality = None
++        mask_img = None
++
++        header = f"req_id={req_id} stage={stage_id} entity={primary_entity_id} role=primary"
++        vis_img = draw_boxes(img_bgr, boxes_xyxy=None, prompt=prompt_primary, found=False, header=header)
+ 
+         if boxes is not None and len(boxes) > 0:
+             h, w, _ = image_source_rgb.shape
+-            boxes = boxes * torch.Tensor([w, h, w, h])
++            scale = torch.tensor([w, h, w, h], device=boxes.device, dtype=boxes.dtype)
++            boxes = boxes * scale
+             input_boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").cpu().numpy()
+ 
+-            # SAM2 segmentation
+-            with torch.inference_mode():
++            with torch.inference_mode(), amp_ctx():
+                 masks, scores, _ = sam2_predictor.predict(
+                     point_coords=None,
+                     point_labels=None,
+                     box=input_boxes,
+                     multimask_output=False,
+                 )
++
+             if masks.ndim == 4:
+-                masks = masks.squeeze(1)  # (N,H,W)
++                masks = masks.squeeze(1)
+ 
+-            # scores maybe (N,1) -> (N,)
+             scores = scores.tolist()
+             if len(scores) > 0 and isinstance(scores[0], (list, tuple, np.ndarray)):
+                 scores = [float(s[0]) for s in scores]
+ 
+-            # confidences -> list
+             if isinstance(confidences, torch.Tensor):
+                 confidences_list = confidences.detach().cpu().numpy().tolist()
+             else:
+@@ -290,59 +508,163 @@ def main():
+ 
+             labels = list(labels)
+ 
+-            idx = int(np.argmax(scores))
+-            found = True
++            raw_candidates = []
++            for i, box_i in enumerate(input_boxes):
++                text_conf = _safe_float(confidences_list[i] if i < len(confidences_list) else 0.0)
++                mask_score = _safe_float(scores[i] if i < len(scores) else 0.0)
++                mq = mask_quality_from_bbox(mask_score, box_i, int(w), int(h))
++                proposal_score = 0.6 * mask_score + 0.4 * text_conf
++                raw_candidates.append(
++                    {
++                        "bbox": [float(x) for x in box_i.tolist()],
++                        "score": proposal_score,
++                        "text_conf": text_conf,
++                        "mask_score": mask_score,
++                        "mask_quality": mq,
++                        "class_name": labels[i] if i < len(labels) else "target",
++                    }
++                )
++
++            raw_candidates.sort(key=lambda c: c["score"], reverse=True)
++            topk_candidates = []
++            for rank, cand in enumerate(raw_candidates[:TOPK_PRIMARY], start=1):
++                topk_candidates.append(
++                    {
++                        "rank": rank,
++                        "bbox": cand["bbox"],
++                        "score": cand["score"],
++                        "text_conf": cand["text_conf"],
++                        "mask_score": cand["mask_score"],
++                        "mask_quality": cand["mask_quality"],
++                        "class_name": cand["class_name"],
++                    }
++                )
++
++            best_cand = topk_candidates[0]
++            idx = next(
++                (
++                    i
++                    for i, cand in enumerate(raw_candidates)
++                    if cand["bbox"] == best_cand["bbox"]
++                ),
++                0,
++            )
++
++            best_mask_quality = _safe_float(best_cand.get("mask_quality"), 0.0)
++            proposal_uncertainty = uncertainty_from_candidates(
++                topk_candidates,
++                low_mask_confidence=(best_mask_quality < MASK_QUALITY_LOW),
++            )
++            proposal_status = proposal_status_from_candidates(
++                topk_candidates,
++                ambiguous_gap=PRIMARY_AMBIGUOUS_GAP,
++                low_quality_flag=(best_mask_quality < MASK_QUALITY_LOW),
++            )
++            spatial_hint = spatial_hint_from_bbox(best_cand["bbox"], int(w), int(h))
++            found = proposal_status != "no_candidate"
+             best = {
+-                "score": float(scores[idx]),  # IMPORTANT: json_publisher thresholds on this score
+-                "bbox": [float(x) for x in input_boxes[idx].tolist()],
+-                "class_name": labels[idx] if idx < len(labels) else "target",
++                "score": float(best_cand["score"]),
++                "bbox": [float(x) for x in best_cand["bbox"]],
++                "class_name": best_cand.get("class_name") or "target",
+                 "prompt": prompt_primary,
+                 "img_width": int(w),
+                 "img_height": int(h),
+             }
+ 
+-            # Vis: mask overlay + boxes
+             vis_img = overlay_masks(img_bgr, masks, best_idx=idx, alpha=MASK_ALPHA)
+             vis_img = draw_boxes(
+                 vis_img,
+                 boxes_xyxy=input_boxes,
+                 labels=labels,
+-                scores=confidences_list,   # show GDINO conf text
++                scores=confidences_list,
+                 best_idx=idx,
+                 prompt=prompt_primary,
+-                found=True
++                found=True,
++                header=header,
+             )
++            mask_img = best_binary_mask(masks, idx, int(w), int(h))
++
++        out = {
++            "found": found,
++            **best,
++            "t_wall": time.time(),
++            "vis_path": str(VIS_PATH),
++            "proposal_status": proposal_status,
++            "topk_candidates": topk_candidates,
++            "spatial_hint": spatial_hint,
++            "proposal_uncertainty": proposal_uncertainty,
++        }
++        if frame_stamp is not None:
++            out["frame_stamp"] = frame_stamp
++        if best_mask_quality is not None:
++            out["mask_quality"] = float(best_mask_quality)
++        if topk_candidates:
++            out["best_candidate"] = topk_candidates[0]
++        if found and mask_img is not None:
++            out["mask_used"] = True
++            out["mask_path"] = str(MASK_PATH)
++        else:
++            out["mask_used"] = False
++
++        # NEW: structured fields (central_runtime will gate on these once available)
++        if req_id is not None:
++            out["req_id"] = req_id
++        if stage_id is not None:
++            out["stage_id"] = stage_id
++        if primary_entity_id is not None:
++            out["entity_id"] = primary_entity_id
++        out["role"] = "primary"  # safe even in legacy mode
+ 
+-        out = {"found": found, **best, "t_wall": time.time(), "vis_path": str(VIS_PATH)}
+         atomic_json(OUT_PATH, out)
+         atomic_imwrite(VIS_PATH, vis_img)
++        if found and mask_img is not None:
++            atomic_imwrite(MASK_PATH, mask_img)
++        elif MASK_PATH.exists():
++            try:
++                MASK_PATH.unlink()
++            except OSError:
++                pass
+ 
+         # -------------------------
+-        # CUE: low-frequency GDINO only (no SAM2 by default)
++        # CUE: low-frequency GDINO only
+         # -------------------------
+         now = time.time()
+-        if now - last_cue_t >= CUE_PERIOD_S:
++        if now - last_cue_t >= CUE_PERIOD_S and cues:
+             last_cue_t = now
+-            cues = read_cues()
+-            cue_prompt = cues[cue_idx % len(cues)]
++
++            cue_sel = cues[cue_idx % len(cues)]
+             cue_idx += 1
+ 
+-            boxes_c, conf_c, labels_c = predict(
+-                model=grounding_model,
+-                image=image_tensor,
+-                caption=cue_prompt,
+-                box_threshold=CUE_BOX_THRESHOLD,
+-                text_threshold=CUE_TEXT_THRESHOLD,
+-            )
++            cue_prompt = cue_sel.get("prompt") or "exit sign."
++            cue_entity_id = cue_sel.get("entity_id")
++
++            with torch.inference_mode(), amp_ctx():
++                boxes_c, conf_c, labels_c = predict(
++                    model=grounding_model,
++                    image=image_tensor,
++                    caption=cue_prompt,
++                    box_threshold=CUE_BOX_THRESHOLD,
++                    text_threshold=CUE_TEXT_THRESHOLD,
++                )
+ 
+             cue_found = False
+             cue_best = {"score": 0.0, "bbox": None, "class_name": None, "prompt": cue_prompt}
++            cue_status = "no_candidate"
++            cue_topk = []
++            cue_spatial_hint = {}
++            cue_uncertainty = {
++                "multi_candidate": False,
++                "ambiguous_top2_gap": None,
++                "low_mask_confidence": False,
++            }
+ 
+-            cue_vis = draw_boxes(img_bgr, boxes_xyxy=None, prompt=cue_prompt, found=False)
++            cue_header = f"req_id={req_id} stage={stage_id} entity={cue_entity_id} role=cue"
++            cue_vis = draw_boxes(img_bgr, boxes_xyxy=None, prompt=cue_prompt, found=False, header=cue_header)
+ 
+             if boxes_c is not None and len(boxes_c) > 0:
+                 h, w, _ = image_source_rgb.shape
+-                boxes_c = boxes_c * torch.Tensor([w, h, w, h])
++                scale_c = torch.tensor([w, h, w, h], device=boxes_c.device, dtype=boxes_c.dtype)
++                boxes_c = boxes_c * scale_c
+                 input_boxes_c = box_convert(boxes=boxes_c, in_fmt="cxcywh", out_fmt="xyxy").cpu().numpy()
+ 
+                 if isinstance(conf_c, torch.Tensor):
+@@ -352,14 +674,44 @@ def main():
+ 
+                 labels_c = list(labels_c)
+ 
++                raw_cue_candidates = []
++                for i, box_i in enumerate(input_boxes_c):
++                    conf_i = _safe_float(conf_list[i] if i < len(conf_list) else 0.0)
++                    raw_cue_candidates.append(
++                        {
++                            "bbox": [float(x) for x in box_i.tolist()],
++                            "score": conf_i,
++                            "text_conf": conf_i,
++                            "class_name": labels_c[i] if i < len(labels_c) else "cue",
++                        }
++                    )
++                raw_cue_candidates.sort(key=lambda c: c["score"], reverse=True)
++                for rank, cand in enumerate(raw_cue_candidates[:TOPK_CUE], start=1):
++                    cue_topk.append(
++                        {
++                            "rank": rank,
++                            "bbox": cand["bbox"],
++                            "score": cand["score"],
++                            "text_conf": cand["text_conf"],
++                            "class_name": cand["class_name"],
++                        }
++                    )
++
+                 idxc = pick_best_box_by_conf_area(input_boxes_c, conf_list)
+-                if idxc is not None:
+-                    conf_best = float(conf_list[idxc])
++                if idxc is not None and cue_topk:
++                    conf_best = float(cue_topk[0]["score"])
++                    cue_status = proposal_status_from_candidates(
++                        cue_topk,
++                        ambiguous_gap=CUE_AMBIGUOUS_GAP,
++                        low_quality_flag=False,
++                    )
++                    cue_uncertainty = uncertainty_from_candidates(cue_topk, low_mask_confidence=False)
++                    cue_spatial_hint = spatial_hint_from_bbox(cue_topk[0]["bbox"], int(w), int(h))
+                     cue_found = (conf_best >= CUE_CONF_THRESHOLD)
+                     cue_best = {
+                         "score": conf_best,
+-                        "bbox": [float(x) for x in input_boxes_c[idxc].tolist()],
+-                        "class_name": labels_c[idxc] if idxc < len(labels_c) else "cue",
++                        "bbox": [float(x) for x in cue_topk[0]["bbox"]],
++                        "class_name": cue_topk[0].get("class_name") or "cue",
+                         "prompt": cue_prompt,
+                         "img_width": int(w),
+                         "img_height": int(h),
+@@ -372,14 +724,34 @@ def main():
+                         scores=conf_list,
+                         best_idx=idxc,
+                         prompt=cue_prompt,
+-                        found=True
++                        found=True,
++                        header=cue_header,
+                     )
++            cue_out = {
++                "found": cue_found,
++                **cue_best,
++                "t_wall": time.time(),
++                "vis_path": str(CUE_VIS_PATH),
++                "proposal_status": cue_status,
++                "topk_candidates": cue_topk,
++                "spatial_hint": cue_spatial_hint,
++                "proposal_uncertainty": cue_uncertainty,
++            }
++            if cue_topk:
++                cue_out["best_candidate"] = cue_topk[0]
++            if req_id is not None:
++                cue_out["req_id"] = req_id
++            if stage_id is not None:
++                cue_out["stage_id"] = stage_id
++            if cue_entity_id is not None:
++                cue_out["entity_id"] = cue_entity_id
++            cue_out["role"] = "cue"
+ 
+-            cue_out = {"found": cue_found, **cue_best, "t_wall": time.time(), "vis_path": str(CUE_VIS_PATH)}
+             atomic_json(OUT_CUE_PATH, cue_out)
+             atomic_imwrite(CUE_VIS_PATH, cue_vis)
+ 
+         time.sleep(0.005)
+ 
++
+ if __name__ == "__main__":
+     main()
