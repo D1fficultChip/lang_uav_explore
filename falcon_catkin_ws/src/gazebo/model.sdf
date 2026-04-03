@@ -6,12 +6,52 @@
     <link name="base_link">
       <pose>0 0 0 0 0 0</pose>
 
-      <!-- 一个很小的盒子，方便你在GUI里看到“相机架子” -->
-      <visual name="body_vis">
-        <geometry>
-          <box><size>0.3 0.3 0.1</size></box>
-        </geometry>
-      </visual>
+      <visual name="base_vis">
+              <geometry><cylinder><radius>0.12</radius><length>0.06</length></cylinder></geometry>
+              <material><script><name>Gazebo/DarkGrey</name></script></material>
+            </visual>
+
+            <visual name="arms_vis">
+              <geometry><box><size>0.6 0.03 0.015</size></box></geometry>
+              <pose>0 0 0 0 0 0.785</pose>
+            </visual>
+            <visual name="arms_vis_2">
+              <geometry><box><size>0.6 0.03 0.015</size></box></geometry>
+              <pose>0 0 0 0 0 -0.785</pose>
+            </visual>
+
+            <visual name="motor_1"><pose>0.21 0.21 0.02 0 0 0</pose>
+              <geometry><cylinder><radius>0.03</radius><length>0.02</length></cylinder></geometry>
+              <material><script><name>Gazebo/Black</name></script></material>
+            </visual>
+            <visual name="motor_2"><pose>-0.21 0.21 0.02 0 0 0</pose>
+              <geometry><cylinder><radius>0.03</radius><length>0.02</length></cylinder></geometry>
+              <material><script><name>Gazebo/Black</name></script></material>
+            </visual>
+            <visual name="motor_3"><pose>0.21 -0.21 0.02 0 0 0</pose>
+              <geometry><cylinder><radius>0.03</radius><length>0.02</length></cylinder></geometry>
+              <material><script><name>Gazebo/Black</name></script></material>
+            </visual>
+            <visual name="motor_4"><pose>-0.21 -0.21 0.02 0 0 0</pose>
+              <geometry><cylinder><radius>0.03</radius><length>0.02</length></cylinder></geometry>
+              <material><script><name>Gazebo/Black</name></script></material>
+            </visual>
+
+            <visual name="prop_1"><pose>0.21 0.21 0.04 0 0 0</pose>
+              <geometry><cylinder><radius>0.05</radius><length>0.005</length></cylinder></geometry>
+              <material><script><name>Gazebo/White</name></script></material> </visual>
+            <visual name="prop_2"><pose>-0.21 0.21 0.04 0 0 0</pose>
+              <geometry><cylinder><radius>0.05</radius><length>0.005</length></cylinder></geometry>
+              <material><script><name>Gazebo/White</name></script></material>
+            </visual>
+            <visual name="prop_3"><pose>0.21 -0.21 0.04 0 0 0</pose>
+              <geometry><cylinder><radius>0.05</radius><length>0.005</length></cylinder></geometry>
+              <material><script><name>Gazebo/White</name></script></material>
+            </visual>
+            <visual name="prop_4"><pose>-0.21 -0.21 0.04 0 0 0</pose>
+              <geometry><cylinder><radius>0.05</radius><length>0.005</length></cylinder></geometry>
+              <material><script><name>Gazebo/White</name></script></material>
+            </visual>
 
       <!-- Camera sensor -->
       <sensor name="rgb_camera" type="camera">

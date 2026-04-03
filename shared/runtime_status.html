@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>统一中枢监控面板</title>
+  <style>
+    :root {
+      --bg: #eef3f7;
+      --bg-accent: #dfe9f2;
+      --card: rgba(255, 255, 255, 0.9);
+      --card-strong: #ffffff;
+      --border: #cfd9e3;
+      --text: #1c2a36;
+      --muted: #6a7f90;
+      --accent: #0b7fab;
+      --accent-soft: #dff4fb;
+      --ok: #1d9a64;
+      --warn: #c98717;
+      --bad: #c94b57;
+      --shadow: 0 18px 36px rgba(40, 68, 94, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(11,127,171,0.12), transparent 34%),
+        radial-gradient(circle at top right, rgba(29,154,100,0.08), transparent 28%),
+        linear-gradient(180deg, var(--bg-accent) 0%, var(--bg) 180px, var(--bg) 100%);
+    }
+    .page {
+      max-width: 1520px;
+      margin: 0 auto;
+      padding: 18px 18px 28px;
+    }
+    .hero {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: 26px;
+      letter-spacing: 0.02em;
+    }
+    .hero p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      max-width: 760px;
+      line-height: 1.45;
+    }
+    .hero-meta {
+      text-align: right;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.7;
+      white-space: nowrap;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 12px;
+      align-items: start;
+    }
+    .stack {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+    .left-stack { grid-column: span 4; }
+    .right-stack { grid-column: span 8; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      backdrop-filter: blur(6px);
+    }
+    .card.strong {
+      background: var(--card-strong);
+    }
+    .span-2 { grid-column: span 8; }
+    .span-3 { grid-column: 1 / -1; }
+    .titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.01em;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+    .pill.ok { background: rgba(29,154,100,0.12); color: var(--ok); }
+    .pill.warn { background: rgba(201,135,23,0.12); color: var(--warn); }
+    .pill.bad { background: rgba(201,75,87,0.12); color: var(--bad); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .metric {
+      padding: 10px 11px;
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(11,127,171,0.08), rgba(11,127,171,0.03));
+      border: 1px solid rgba(11,127,171,0.08);
+    }
+    .metric .label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .metric .value {
+      margin-top: 6px;
+      font-size: 21px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .kv {
+      display: grid;
+      grid-template-columns: 116px 1fr;
+      gap: 6px 10px;
+      font-size: 12px;
+    }
+    .k { color: var(--muted); }
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .tri-col {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .mini {
+      border: 1px solid rgba(31, 52, 70, 0.08);
+      border-radius: 12px;
+      padding: 11px;
+      background: rgba(255,255,255,0.72);
+    }
+    .mini-title {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .diag {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(11,127,171,0.06), rgba(31, 52, 70, 0.02));
+      border: 1px solid rgba(31,52,70,0.08);
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text);
+    }
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .image-card {
+      border: 1px solid rgba(31, 52, 70, 0.08);
+      border-radius: 14px;
+      padding: 11px;
+      background: rgba(255,255,255,0.76);
+    }
+    .image-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .image-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .image-wrap {
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      border-radius: 10px;
+      overflow: hidden;
+      background: linear-gradient(180deg, rgba(11,127,171,0.08), rgba(31,52,70,0.03));
+      border: 1px solid rgba(31,52,70,0.08);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .image-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      background: #f4f8fb;
+    }
+    .img-empty {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      padding: 10px;
+      text-align: center;
+    }
+    .note {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .tagrow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      background: rgba(11,127,171,0.1);
+      color: var(--accent);
+    }
+    .tag.ok { background: rgba(29,154,100,0.14); color: var(--ok); }
+    .tag.warn { background: rgba(201,135,23,0.14); color: var(--warn); }
+    .tag.bad { background: rgba(201,75,87,0.14); color: var(--bad); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
+      font-size: 11px;
+      color: var(--text);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      background: rgba(255,255,255,0.52);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 8px 7px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid rgba(31,52,70,0.08);
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      background: rgba(11,127,171,0.04);
+    }
+    tr:last-child td { border-bottom: none; }
+    .empty {
+      color: var(--muted);
+      font-style: italic;
+    }
+    .footer {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    @media (max-width: 1180px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .left-stack, .right-stack, .span-2, .span-3 { grid-column: 1 / -1; }
+    }
+    @media (max-width: 820px) {
+      .page { padding: 20px 14px 28px; }
+      .hero { flex-direction: column; align-items: start; }
+      .hero-meta { text-align: left; white-space: normal; }
+      .grid, .two-col, .tri-col, .metrics, .image-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="hero">
+      <div>
+        <h1>统一中枢监控面板</h1>
+        <p>把运行时状态、AI 双路监控和语义控制收在一个界面里。左边看任务推进，中间看检测与验证，右边看语义控制对搜索的实时影响。</p>
+      </div>
+      <div class="hero-meta">
+        <div>数据源: <code>runtime_status.json</code> + <code>cue_hist_status.json</code></div>
+        <div>刷新频率: 0.5s</div>
+        <div>当前时间: <span id="ts">--</span></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="stack left-stack">
+        <section class="card strong overview">
+          <div class="titlebar">
+            <h2 class="title">任务运行总览</h2>
+            <div class="pill" id="mission-pill">等待数据</div>
+          </div>
+          <div class="metrics" id="runtime-metrics"></div>
+          <div class="kv" id="runtime"></div>
+        </section>
+
+        <section class="card skill-panel">
+          <div class="titlebar">
+            <h2 class="title">观察 / 跟踪</h2>
+            <div class="subtitle">技能态与判定窗口</div>
+          </div>
+          <div class="kv" id="skillstate"></div>
+        </section>
+
+        <section class="card diagnostics-panel">
+          <div class="titlebar">
+            <h2 class="title">最近诊断</h2>
+            <div class="subtitle">中枢层摘要</div>
+          </div>
+          <pre id="diagnostics">等待数据...</pre>
+        </section>
+      </div>
+
+      <div class="stack right-stack">
+        <section class="card ai-panel">
+          <div class="titlebar">
+            <h2 class="title">AI / 语义综合监控</h2>
+            <div class="subtitle">识别图、线索参与状态、语义控制参数和实时诊断统一展示</div>
+          </div>
+          <div class="two-col">
+            <div class="mini">
+              <h3 class="mini-title">检测与定位通道</h3>
+              <div class="kv" id="perception"></div>
+            </div>
+            <div class="mini">
+              <h3 class="mini-title">语义验证通道</h3>
+              <div class="kv" id="semantic"></div>
+            </div>
+          </div>
+          <div class="image-grid">
+            <div class="image-card">
+              <div class="image-head">
+                <h3 class="image-title">主目标识别图</h3>
+                <div class="tagrow"><span class="tag" id="primary-route-tag">PRIMARY</span></div>
+              </div>
+              <div class="image-wrap" id="primary-image-wrap">
+                <div class="img-empty">等待 infer.json / infer_vis.jpg ...</div>
+              </div>
+              <div class="note" id="primary-image-note">等待主目标识别结果...</div>
+              <div class="kv" id="primary-infer" style="margin-top:10px;"></div>
+            </div>
+            <div class="image-card">
+              <div class="image-head">
+                <h3 class="image-title">线索识别图</h3>
+                <div class="tagrow" id="cue-tag-row">
+                  <span class="tag" id="cue-route-tag">CUE</span>
+                  <span class="tag" id="cue-effect-tag">未判定</span>
+                </div>
+              </div>
+              <div class="image-wrap" id="cue-image-wrap">
+                <div class="img-empty">等待 infer_cue.json / infer_cue_vis.jpg ...</div>
+              </div>
+              <div class="note" id="cue-image-note">等待线索识别结果...</div>
+              <div class="kv" id="cue-infer" style="margin-top:10px;"></div>
+            </div>
+          </div>
+          <div class="tri-col" style="margin-top:10px;">
+            <div class="mini">
+              <h3 class="mini-title">语义控制参数</h3>
+              <div class="kv" id="semantic-control"></div>
+            </div>
+            <div class="mini">
+              <h3 class="mini-title">语义控制有效性</h3>
+              <div class="diag" id="semantic-status">等待语义控制流</div>
+            </div>
+            <div class="mini">
+              <h3 class="mini-title">运行诊断</h3>
+              <div class="diag" id="semantic-diagnosis">等待数据...</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card events-panel">
+          <div class="titlebar">
+            <h2 class="title">最近事件</h2>
+            <div class="subtitle">最近 8 条运行时事件</div>
+          </div>
+          <table>
+            <thead>
+              <tr><th>事件</th><th>阶段</th><th>详情</th></tr>
+            </thead>
+            <tbody id="events"></tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+
+    <div class="footer">语义热力图已并入本页的控制摘要；单独页面仅保留简化控制视图。</div>
+  </div>
+
+  <script>
+    function esc(v) {
+      if (v === null || v === undefined || v === "") return "-";
+      if (typeof v === "object") return JSON.stringify(v);
+      return String(v);
+    }
+    function kv(containerId, pairs) {
+      const el = document.getElementById(containerId);
+      el.innerHTML = pairs.map(([k, v]) => `<div class="k">${k}</div><div>${esc(v)}</div>`).join("");
+    }
+    function metricGrid(items) {
+      const el = document.getElementById("runtime-metrics");
+      el.innerHTML = items.map(item => `
+        <div class="metric">
+          <div class="label">${esc(item.label)}</div>
+          <div class="value">${esc(item.value)}</div>
+        </div>
+      `).join("");
+    }
+    function pillClass(ok, warn) {
+      if (ok) return "pill ok";
+      if (warn) return "pill warn";
+      return "pill bad";
+    }
+    function setMissionPill(text, ok, warn) {
+      const el = document.getElementById("mission-pill");
+      el.className = pillClass(ok, warn);
+      el.textContent = text;
+    }
+    function setSemanticStatus(text, ok, warn) {
+      const el = document.getElementById("semantic-status");
+      el.textContent = text;
+      el.style.color = ok ? "var(--ok)" : (warn ? "var(--warn)" : "var(--text)");
+    }
+    function setTag(id, text, tone) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text;
+      el.className = "tag" + (tone ? ` ${tone}` : "");
+    }
+    function setImagePanel(wrapId, noteId, obj, fallbackName, noteText) {
+      const wrap = document.getElementById(wrapId);
+      const note = document.getElementById(noteId);
+      const path = obj && obj.vis_path ? String(obj.vis_path).replace("/shared/", "") : fallbackName;
+      const hasPayload = obj && Object.keys(obj).length > 0;
+      if (hasPayload) {
+        wrap.innerHTML = `<img alt="${wrapId}" src="${path}?t=${Date.now()}">`;
+      } else {
+        wrap.innerHTML = `<div class="img-empty">暂无识别结果图</div>`;
+      }
+      note.textContent = noteText || "等待数据...";
+    }
+    async function refresh() {
+      document.getElementById("ts").textContent = new Date().toLocaleTimeString();
+      try {
+        const [runtimeRes, cueRes] = await Promise.all([
+          fetch("runtime_status.json?t=" + Date.now(), { cache: "no-store" }),
+          fetch("cue_hist_status.json?t=" + Date.now(), { cache: "no-store" }).catch(() => null),
+        ]);
+
+        const s = runtimeRes.ok ? await runtimeRes.json() : {};
+        const cue = cueRes && cueRes.ok ? await cueRes.json() : {};
+        const [inferRes, inferCueRes] = await Promise.all([
+          fetch("infer.json?t=" + Date.now(), { cache: "no-store" }).catch(() => null),
+          fetch("infer_cue.json?t=" + Date.now(), { cache: "no-store" }).catch(() => null),
+        ]);
+        const infer = inferRes && inferRes.ok ? await inferRes.json() : {};
+        const inferCue = inferCueRes && inferCueRes.ok ? await inferCueRes.json() : {};
+
+        const rt = s.runtime || {};
+        const loc = s.localization || {};
+        const obs = s.observe || {};
+        const track = s.track || {};
+        const ver = s.verification || {};
+        const sem = s.semantic || {};
+        const per = s.perception || {};
+        const criteria = s.criteria || {};
+
+        metricGrid([
+          { label: "当前阶段", value: rt.stage || "-" },
+          { label: "当前意图", value: rt.intent || "-" },
+          { label: "任务耗时", value: rt.mission_elapsed == null ? "-" : `${rt.mission_elapsed}s` },
+          { label: "阶段耗时", value: rt.stage_elapsed == null ? "-" : `${rt.stage_elapsed}s` },
+        ]);
+
+        const missionText =
+          criteria.success_met ? "成功条件已满足" :
+          criteria.failure_met ? "失败条件已满足" :
+          ver.entity_verified ? "目标已验证" :
+          "任务进行中";
+        setMissionPill(missionText, Boolean(criteria.success_met || ver.entity_verified), Boolean(!criteria.success_met && !criteria.failure_met), Boolean(criteria.failure_met));
+
+        kv("runtime", [
+          ["当前 skill", rt.current_skill_id],
+          ["当前实体", rt.active_entity],
+          ["请求编号", rt.current_req_id],
+          ["目标世界坐标", loc.target_world],
+          ["验证状态", `${ver.entity_verified} / ${ver.verification_status}`],
+          ["成功判定", criteria.success_met],
+          ["失败判定", criteria.failure_met],
+        ]);
+
+        kv("perception", [
+          ["主目标检测", `${per.primary_found} / score=${esc(per.primary_score)}`],
+          ["主目标状态", per.primary_status],
+          ["线索检测", `${per.cue_found} / score=${esc(per.cue_score)}`],
+          ["定位成功", loc.found],
+          ["定位置信度", loc.confidence],
+          ["目标世界坐标", loc.target_world],
+          ["定位失败原因", loc.failure_reason],
+        ]);
+
+        kv("semantic", [
+          ["语义状态", sem.status],
+          ["语义置信度", sem.confidence],
+          ["需要补观察", sem.need_additional_view],
+          ["建议后续动作", sem.recommended_followup],
+          ["失败假设", sem.failure_hypothesis],
+          ["解释", sem.explanation],
+          ["最近验证时间", sem.last_semantic_verify_t],
+        ]);
+
+        const inferTop1 = Array.isArray(infer.topk_candidates) && infer.topk_candidates.length ? infer.topk_candidates[0] : null;
+        const cueTop1 = Array.isArray(inferCue.topk_candidates) && inferCue.topk_candidates.length ? inferCue.topk_candidates[0] : null;
+
+        const requestCues = Array.isArray(cue.request_cues) ? cue.request_cues : [];
+        const cueActive = requestCues.length > 0;
+        const cueDiagnosis = cue.diagnosis || "等待 cue 控制诊断...";
+
+        setTag("primary-route-tag", infer && infer.found ? "PRIMARY ACTIVE" : "PRIMARY", infer && infer.found ? "ok" : "");
+        setTag("cue-route-tag", cueActive ? "CUE ROUTE ON" : "CUE ROUTE OFF", cueActive ? "ok" : "warn");
+        setTag("cue-effect-tag", cueActive ? "参与前沿偏置" : "仅旁路监控", cueActive ? "ok" : "warn");
+
+        setImagePanel(
+          "primary-image-wrap",
+          "primary-image-note",
+          infer,
+          "infer_vis.jpg",
+          infer && infer.found
+            ? `主目标检测已命中，proposal=${esc(infer.proposal_status)}，score=${esc(infer.score)}`
+            : `主目标尚未命中，proposal=${esc(infer.proposal_status)}`
+        );
+        setImagePanel(
+          "cue-image-wrap",
+          "cue-image-note",
+          inferCue,
+          "infer_cue_vis.jpg",
+          cueActive
+            ? `当前 stage 配置了 cue_targets，线索图会参与 cue_bias。诊断: ${cueDiagnosis}`
+            : `当前 stage 没有 cue_targets，这张线索图只是感知侧旁路输出，不参与 FALCON 前沿偏置。诊断: ${cueDiagnosis}`
+        );
+
+        kv("primary-infer", [
+          ["found", infer.found],
+          ["class_name", infer.class_name],
+          ["score", infer.score],
+          ["proposal_status", infer.proposal_status],
+          ["entity_id", infer.entity_id],
+          ["role", infer.role],
+          ["bbox", infer.bbox],
+          ["image_region", infer.spatial_hint && infer.spatial_hint.image_region],
+          ["top1", inferTop1 ? `${inferTop1.class_name} / ${Number(inferTop1.score ?? 0).toFixed(3)}` : "-"],
+          ["topk_count", Array.isArray(infer.topk_candidates) ? infer.topk_candidates.length : 0],
+          ["vis_path", infer.vis_path],
+        ]);
+
+        kv("cue-infer", [
+          ["found", inferCue.found],
+          ["class_name", inferCue.class_name],
+          ["score", inferCue.score],
+          ["proposal_status", inferCue.proposal_status],
+          ["entity_id", inferCue.entity_id],
+          ["role", inferCue.role],
+          ["bbox", inferCue.bbox],
+          ["image_region", inferCue.spatial_hint && inferCue.spatial_hint.image_region],
+          ["top1", cueTop1 ? `${cueTop1.class_name} / ${Number(cueTop1.score ?? 0).toFixed(3)}` : "-"],
+          ["topk_count", Array.isArray(inferCue.topk_candidates) ? inferCue.topk_candidates.length : 0],
+          ["vis_path", inferCue.vis_path],
+          ["cue_effective", cueActive ? "yes" : "no"],
+        ]);
+
+        kv("skillstate", [
+          ["Observe phase", obs.phase],
+          ["Observe reason", obs.reason],
+          ["Observe goal", obs.observe_goal],
+          ["Observe target_world", loc.target_world],
+          ["Track phase", track.phase],
+          ["Track reason", track.reason],
+          ["Verify window", ver.verify_window_active],
+          ["Criteria success/failure", `${criteria.success_met} / ${criteria.failure_met}`],
+        ]);
+
+        kv("semantic-control", [
+          ["mode", cue.mode],
+          ["strength", cue.semantic_strength == null ? "-" : Number(cue.semantic_strength).toFixed(3)],
+          ["target_conf", cue.target_confidence == null ? "-" : Number(cue.target_confidence).toFixed(3)],
+          ["semantic_urgency", cue.semantic_urgency == null ? "-" : Number(cue.semantic_urgency).toFixed(3)],
+          ["bearing_conf", cue.bearing_confidence == null ? "-" : Number(cue.bearing_confidence).toFixed(3)],
+          ["request_cues", Array.isArray(cue.request_cues) && cue.request_cues.length ? cue.request_cues.join(", ") : "none"],
+          ["peak_bin", cue.peak_bin],
+          ["peak_value", cue.peak_value == null ? "-" : Number(cue.peak_value).toFixed(3)],
+          ["energy", cue.energy == null ? "-" : Number(cue.energy).toFixed(3)],
+          ["age_s", cue.age_s == null ? "-" : Number(cue.age_s).toFixed(3)],
+          ["last_cue_score", cue.last_cue_score == null ? "-" : Number(cue.last_cue_score).toFixed(3)],
+          ["last_cue_entity", cue.last_cue_entity],
+        ]);
+
+        const semanticStatus =
+          cue.mode
+            ? `mode=${cue.mode} | ctrl_age=${cue.ctrl_age_s == null ? "-" : Number(cue.ctrl_age_s).toFixed(2) + "s"} | ${cueActive ? "cue 已接入当前请求" : "当前无 cue_targets"}`
+            : "等待语义控制流";
+        setSemanticStatus(semanticStatus, Boolean(cue.hist_fresh && cueActive), Boolean(!cueActive || !cue.hist_fresh));
+        document.getElementById("semantic-diagnosis").textContent = cue.diagnosis || "等待数据...";
+
+        const events = (s.recent_events || []).slice().reverse();
+        document.getElementById("events").innerHTML = events.length ? events.map(ev => `
+          <tr>
+            <td>${esc(ev.event_type)}</td>
+            <td>${esc(ev.stage_id)}</td>
+            <td>${esc(ev.details)}</td>
+          </tr>
+        `).join("") : `<tr><td colspan="3" class="empty">还没有事件数据</td></tr>`;
+
+        const diags = s.diagnostics || [];
+        document.getElementById("diagnostics").textContent =
+          diags.length ? diags.map(d => `[${d.severity}] ${d.code}: ${d.message}`).join("\n") : "无明显诊断";
+      } catch (e) {
+        document.getElementById("diagnostics").textContent = "读取状态失败: " + e;
+      }
+    }
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>

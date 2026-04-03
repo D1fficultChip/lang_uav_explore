@@ -1,0 +1,58 @@
+shared_dir: /home/young/uav_demo/shared
+infer_json: infer.json
+prompt_txt: prompt.txt
+tick_hz: 10.0
+log_jsonl_path: plan_runtime.jsonl
+stage_settle_s: 0.5
+perception_request_json: perception_request.json
+emit_cues_txt: true
+cues_txt: cues.txt
+mux:
+  select_service: /cmd_mux/select
+  hold_topic: /hold/pos_cmd
+  selected_topic: /cmd_mux/selected
+  pre_switch_hover_s: 0.3
+  odom_topic: /vins/imu_propagate_norm
+  odom_max_age_s: 0.3
+  odom_wait_timeout_s: 2.0
+  intent_source:
+    SEARCH: /falcon/pos_cmd
+    NAVIGATE: /ego/pos_cmd
+    TRACK: /falcon/pos_cmd
+ego_goal_topic: /move_base_simple/goal
+entity_goals:
+  E_safe_exit:
+    frame: world
+    x: -14.0
+    y: -14.0
+    z: 1.0
+    yaw_deg: 0.0
+adapters:
+  SEARCH:
+    container: ssh:nv@192.168.1.122
+    cmd:
+    - bash
+    - -lc
+    - source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash &&
+      roslaunch exploration_manager exploration.launch map_name:=complex_office_2
+    pidfile: /shared/falcon_search.pid
+    logfile: /shared/falcon_search.log
+    stop_pattern: roslaunch exploration_manager exploration.launch
+  NAVIGATE:
+    container: ssh:nv@192.168.1.122
+    cmd:
+    - bash
+    - -lc
+    - source /opt/ros/noetic/setup.bash && source ~/ego_ws/devel/setup.bash && roslaunch
+      ego_planner planner_only.launch
+    pidfile: /shared/ego_nav.pid
+    logfile: /shared/ego_nav.log
+    stop_pattern: roslaunch ego_planner
+    publish_goal_once: false
+    goal_topic: /move_base_simple/goal
+    startup_sleep_s: 0.5
+verified:
+  min_navigate_time_s: 2.0
+  require_found: true
+  min_score: 0.5
+  visible_min_score: 0.5

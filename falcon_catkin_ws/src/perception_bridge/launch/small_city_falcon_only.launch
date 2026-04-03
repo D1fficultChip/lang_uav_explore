@@ -1,0 +1,53 @@
+<launch>
+  <arg name="map_name" default="small_city"/>
+
+  <arg name="init_x" default="-47.0"/>
+  <arg name="init_y" default="0.0"/>
+  <arg name="init_z" default="0.8"/>
+  <arg name="init_yaw" default="0.0"/>
+
+  <arg name="falcon_odom_topic" default="/uav_simulator/odometry_norm"/>
+  <arg name="camera_odom_topic" default="/uav_simulator/camera_odom"/>
+  <arg name="depth_topic" default="/uav_simulator/depth_camera/depth/image_raw"/>
+
+  <arg name="traj_init_dx" default="0.0"/>
+  <arg name="traj_init_dy" default="0.0"/>
+  <arg name="traj_init_dz" default="1.0"/>
+
+  <arg name="frontier_cluster_min" default="40"/>
+  <arg name="frontier_min_visib_num" default="6"/>
+  <arg name="frontier_candidate_rmin" default="0.8"/>
+  <arg name="frontier_candidate_rmax" default="2.0"/>
+  <arg name="frontier_candidate_rnum" default="4"/>
+  <arg name="frontier_min_candidate_clearance" default="0.12"/>
+  <arg name="frontier_min_candidate_occupied_clearance" default="0.30"/>
+  <arg name="frontier_ground_offset" default="0.05"/>
+  <arg name="frontier_min_view_finish_fraction" default="0.15"/>
+
+  <include file="$(find exploration_manager)/launch/exploration.launch">
+    <arg name="map_name" value="$(arg map_name)"/>
+    <arg name="init_x" value="$(arg init_x)"/>
+    <arg name="init_y" value="$(arg init_y)"/>
+    <arg name="init_z" value="$(arg init_z)"/>
+    <arg name="init_yaw" value="$(arg init_yaw)"/>
+    <arg name="odometry_topic" value="$(arg falcon_odom_topic)"/>
+    <arg name="sensor_pose_topic" value="$(arg camera_odom_topic)"/>
+    <arg name="depth_image" value="$(arg depth_topic)"/>
+    <arg name="pose_topic_type" value="odometry"/>
+    <arg name="traj_init_dx" value="$(arg traj_init_dx)"/>
+    <arg name="traj_init_dy" value="$(arg traj_init_dy)"/>
+    <arg name="traj_init_dz" value="$(arg traj_init_dz)"/>
+    <arg name="frontier_cluster_min" value="$(arg frontier_cluster_min)"/>
+    <arg name="frontier_min_visib_num" value="$(arg frontier_min_visib_num)"/>
+    <arg name="frontier_candidate_rmin" value="$(arg frontier_candidate_rmin)"/>
+    <arg name="frontier_candidate_rmax" value="$(arg frontier_candidate_rmax)"/>
+    <arg name="frontier_candidate_rnum" value="$(arg frontier_candidate_rnum)"/>
+    <arg name="frontier_min_candidate_clearance"
+         value="$(arg frontier_min_candidate_clearance)"/>
+    <arg name="frontier_min_candidate_occupied_clearance"
+         value="$(arg frontier_min_candidate_occupied_clearance)"/>
+    <arg name="frontier_ground_offset" value="$(arg frontier_ground_offset)"/>
+    <arg name="frontier_min_view_finish_fraction"
+         value="$(arg frontier_min_view_finish_fraction)"/>
+  </include>
+</launch>

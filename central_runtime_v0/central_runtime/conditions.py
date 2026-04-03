@@ -83,7 +83,7 @@ class ConditionEngine:
         return vis >= seconds
 
     def _verified(self, params: Dict[str, Any], stage_enter_t: float) -> bool:
-        """Prefer external verifier status; otherwise fall back to v0 heuristic semantics."""
+        """Prefer external verifier status; optionally fall back to legacy v0 heuristic semantics."""
         eid = params.get("entity_id")
         if not eid:
             return False
@@ -93,6 +93,8 @@ class ConditionEngine:
                     return True
             except Exception:
                 pass
+        if not bool(self.verified_cfg.get("allow_legacy_verified_fallback", False)):
+            return False
         min_nav = float(self.verified_cfg.get("min_navigate_time_s", 3.0))
         if (time.time() - stage_enter_t) < min_nav:
             return False

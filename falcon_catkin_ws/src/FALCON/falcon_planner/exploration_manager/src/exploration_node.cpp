@@ -28,10 +28,13 @@ int main(int argc, char **argv) {
   // std::cout << system_info;
   // LOG(INFO) << "\n" << system_info;
 
-  // Check if use_sim_time is false
+  // Gazebo simulation normally sets /use_sim_time=true.
+  // Allow it and only warn so direct-sensor simulation can run.
   bool use_sim_time;
   nh.param("/use_sim_time", use_sim_time, false);
-  CHECK(!use_sim_time) << "Please set use_sim_time to false";
+  if (use_sim_time) {
+    LOG(WARNING) << "use_sim_time is true; running in simulation mode.";
+  }
 
   ExplorationFSM fsm;
   fsm.init(nh);

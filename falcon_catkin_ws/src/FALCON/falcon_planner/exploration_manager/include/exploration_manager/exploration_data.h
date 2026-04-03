@@ -32,6 +32,7 @@ struct FSMParam {
   double replan_thresh2_;
   double replan_thresh3_;
   double replan_duration_; // second
+  double start_state_mismatch_thresh_;
   
   double replan_duration_fast_;
   double replan_duration_default_;

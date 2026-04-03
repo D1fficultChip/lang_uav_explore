@@ -41,6 +41,6 @@ voxel_mapping:
 transformer:
   world_frame: "world"
   sensor_frame: "camera"
-  pose_topic_type: "transform" # "pose", "odometry", "transform" 
-  timestamp_tolerance: 0.001 # 1ms
+  pose_topic_type: "odometry" # "pose", "odometry", "transform" 
+  timestamp_tolerance: 0.03 # 30ms, more realistic for Gazebo direct sensor streams
   verbose: false

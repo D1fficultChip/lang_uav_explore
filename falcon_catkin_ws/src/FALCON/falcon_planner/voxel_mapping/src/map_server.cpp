@@ -1092,10 +1092,16 @@ bool MapServer::isInBox(const Position &pos) { return tsdf_->isInBox(pos); };
 bool MapServer::isInBox(const VoxelIndex &idx) { return tsdf_->isInBox(idx); };
 
 OccupancyType MapServer::getOccupancy(const Position &pos) {
+  if (!occupancy_grid_->isInMap(pos)) {
+    return OccupancyType::UNKNOWN;
+  }
   return occupancy_grid_->getVoxel(pos).value;
 }
 
 OccupancyType MapServer::getOccupancy(const VoxelIndex &idx) {
+  if (!occupancy_grid_->isInMap(idx)) {
+    return OccupancyType::UNKNOWN;
+  }
   return occupancy_grid_->getVoxel(idx).value;
 }
 

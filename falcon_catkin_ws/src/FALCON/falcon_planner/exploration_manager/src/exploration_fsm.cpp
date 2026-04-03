@@ -17,6 +17,8 @@ void ExplorationFSM::init(ros::NodeHandle &nh) {
   nh.param("/exploration_manager/fsm/replan_thresh1", fp_->replan_thresh1_, -1.0);
   nh.param("/exploration_manager/fsm/replan_thresh2", fp_->replan_thresh2_, -1.0);
   nh.param("/exploration_manager/fsm/replan_thresh3", fp_->replan_thresh3_, -1.0);
+  nh.param("/exploration_manager/fsm/start_state_mismatch_thresh",
+           fp_->start_state_mismatch_thresh_, 0.6);
   nh.param("/exploration_manager/fsm/replan_duration_fast", fp_->replan_duration_fast_, -1.0);
   nh.param("/exploration_manager/fsm/replan_duration_default", fp_->replan_duration_default_, -1.0);
   nh.param("/exploration_manager/fsm/replan_duration_slow", fp_->replan_duration_slow_, -1.0);
@@ -301,6 +303,34 @@ void ExplorationFSM::FSMCallback(const ros::TimerEvent &e) {
       // Replan from non-static state, starting from 'replan_time' seconds later
       LocalTrajData *info = &planner_manager_->local_data_;
       ros::Time time_now = ros::Time::now();
+      double t_now = (time_now - info->start_time_).toSec();
+      if (t_now < 0.0) {
+        t_now = 0.0;
+      }
+      if (t_now > info->duration_) {
+        t_now = info->duration_;
+      }
+
+      Eigen::Vector3d predicted_pos_now = info->position_traj_.evaluateDeBoorT(t_now);
+      double pos_mismatch = (predicted_pos_now - fd_->odom_pos_).norm();
+
+      if (!std::isfinite(pos_mismatch) ||
+          pos_mismatch > fp_->start_state_mismatch_thresh_) {
+        ROS_WARN("[FSM] Replan fallback to static state due to start-state mismatch. "
+                 "pred=(%.2f, %.2f, %.2f), odom=(%.2f, %.2f, %.2f), err=%.3f > %.3f",
+                 predicted_pos_now.x(), predicted_pos_now.y(), predicted_pos_now.z(),
+                 fd_->odom_pos_.x(), fd_->odom_pos_.y(), fd_->odom_pos_.z(), pos_mismatch,
+                 fp_->start_state_mismatch_thresh_);
+        LOG(WARNING) << "[FSM] Replan fallback to static state, mismatch=" << pos_mismatch
+                     << ", threshold=" << fp_->start_state_mismatch_thresh_;
+
+        fd_->static_state_ = true;
+        fd_->start_pos_ = fd_->odom_pos_;
+        fd_->start_vel_ = fd_->odom_vel_;
+        fd_->start_acc_.setZero();
+        fd_->start_yaw_ << fd_->odom_yaw_, 0, 0;
+        trajectory_start_time_ = ros::Time::now() + ros::Duration(fp_->replan_duration_);
+      } else {
       double t_r = (time_now - info->start_time_).toSec() + fp_->replan_duration_;
       if (t_r > info->duration_) {
         t_r = info->duration_;
@@ -312,6 +342,7 @@ void ExplorationFSM::FSMCallback(const ros::TimerEvent &e) {
       fd_->start_yaw_(0) = info->yaw_traj_.evaluateDeBoorT(t_r)[0];
       fd_->start_yaw_(1) = info->yawdot_traj_.evaluateDeBoorT(t_r)[0];
       fd_->start_yaw_(2) = info->yawdotdot_traj_.evaluateDeBoorT(t_r)[0];
+      }
     }
 
     if (false) {

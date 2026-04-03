@@ -1,4 +1,5 @@
 #include "traj_utils/planning_visualization.h"
+#include <cmath>
 
 using std::cout;
 using std::endl;
@@ -589,15 +590,37 @@ void PlanningVisualization::drawBsplinesPhase2(vector<NonUniformBspline> &bsplin
 void PlanningVisualization::drawBspline(NonUniformBspline &bspline, double size,
                                         const Eigen::Vector4d &color, bool show_ctrl_pts,
                                         double size2, const Eigen::Vector4d &color2, int id1) {
-  if (bspline.getControlPoint().size() == 0)
+  // Visualization only: if nobody subscribes, skip sampling entirely.
+  if (traj_pub_.getNumSubscribers() == 0)
     return;
 
-  vector<Eigen::Vector3d> traj_pts;
-  double tm, tmp;
-  bspline.getTimeSpan(tm, tmp);
+  Eigen::MatrixXd ctrl_pts = bspline.getControlPoint();
+  Eigen::VectorXd knots = bspline.getKnot();
+  if (ctrl_pts.size() == 0 || ctrl_pts.rows() <= 0 || knots.size() <= 0)
+    return;
 
-  for (double t = tm; t <= tmp; t += 0.01) {
+  // knot_size = ctrl_rows + order + 1
+  int inferred_order = static_cast<int>(knots.size()) - static_cast<int>(ctrl_pts.rows()) - 1;
+  if (inferred_order < 1 || ctrl_pts.rows() < inferred_order + 1) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[PlanningVisualization] Skip invalid bspline in drawBspline: ctrl_rows=%d, "
+                      "knot_size=%d, inferred_order=%d",
+                      static_cast<int>(ctrl_pts.rows()), static_cast<int>(knots.size()),
+                      inferred_order);
+    return;
+  }
+
+  vector<Eigen::Vector3d> traj_pts;
+  double duration = bspline.getTimeSum();
+  if (!std::isfinite(duration) || duration <= 0.0)
+    return;
+
+  for (double t = 0.0; t <= duration; t += 0.01) {
     Eigen::Vector3d pt = bspline.evaluateDeBoorT(t);
+    traj_pts.push_back(pt);
+  }
+  if (traj_pts.empty()) {
+    Eigen::Vector3d pt = bspline.evaluateDeBoorT(0.0);
     traj_pts.push_back(pt);
   }
   // displaySphereList(traj_pts, size, color, BSPLINE + id1 % 100);
@@ -605,7 +628,6 @@ void PlanningVisualization::drawBspline(NonUniformBspline &bspline, double size,
 
   // draw the control point
   if (show_ctrl_pts) {
-    Eigen::MatrixXd ctrl_pts = bspline.getControlPoint();
     vector<Eigen::Vector3d> ctp;
     for (int i = 0; i < int(ctrl_pts.rows()); ++i) {
       Eigen::Vector3d pt = ctrl_pts.row(i).transpose();

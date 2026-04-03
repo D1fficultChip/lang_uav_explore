@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 from .adapters.base import Adapter
@@ -180,6 +181,20 @@ class PlanExecutor:
         self.semantic_trigger_on_failure = bool(self.semantic_cfg.get("trigger_on_failure", False))
         self.semantic_auto_apply_followup = bool(self.semantic_cfg.get("auto_apply_followup", True))
         self.semantic_allow_followups = set(self.semantic_cfg.get("allow_followups", []))
+        self.semantic_observe_gate_enabled = bool(self.semantic_cfg.get("observe_gate_enabled", False))
+        self.semantic_observe_trigger_after_hover = bool(self.semantic_cfg.get("observe_trigger_after_hover", True))
+        self.semantic_observe_success_statuses = {
+            str(x).strip().lower()
+            for x in self.semantic_cfg.get("observe_success_statuses", ["supported", "verified"])
+            if str(x).strip()
+        }
+        self.semantic_observe_failure_statuses = {
+            str(x).strip().lower()
+            for x in self.semantic_cfg.get("observe_failure_statuses", ["not_supported"])
+            if str(x).strip()
+        }
+        self.semantic_observe_success_conf_min = float(self.semantic_cfg.get("observe_success_confidence_min", 0.72))
+        self.semantic_observe_failure_conf_min = float(self.semantic_cfg.get("observe_failure_confidence_min", 0.72))
 
         self.stage_id = self._pick_start_stage()
         self.mission_start_t = time.time()
@@ -205,6 +220,7 @@ class PlanExecutor:
         self._last_localization: Optional[TargetLocalization] = None
         self._observe_state: Optional[Dict[str, Any]] = None
         self._track_state: Optional[Dict[str, Any]] = None
+        self._semantic_hold_counts: Dict[str, int] = {}
 
     def close(self):
         if self._log_fp:
@@ -641,8 +657,17 @@ class PlanExecutor:
         base_prefix = "source /opt/ros/noetic/setup.bash >/dev/null 2>&1 || true; "
 
         def _run(cmd: str) -> Tuple[int, str, str]:
-            p = subprocess.run(["bash", "-lc", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            return p.returncode, p.stdout, p.stderr
+            try:
+                p = subprocess.run(
+                    ["bash", "-lc", cmd],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=8.0,
+                )
+                return p.returncode, p.stdout, p.stderr
+            except subprocess.TimeoutExpired:
+                return 124, "", "command timed out"
 
         if check_topic:
             rc, _, _ = _run(base_prefix + f"rostopic info {topic} >/dev/null 2>&1")
@@ -729,9 +754,9 @@ class PlanExecutor:
         ok_goal = self._pub_goal_pose_stamped(
             goal,
             self.ego_goal_topic,
-            retries=5,
-            interval_s=3.0,
-            settle_s=0.5,
+            retries=2,
+            interval_s=0.5,
+            settle_s=0.2,
             check_topic=False,
         )
         ok_trig = True
@@ -739,23 +764,38 @@ class PlanExecutor:
             ok_trig = self._pub_goal_pose_stamped(
                 goal,
                 "/traj_start_trigger",
-                retries=5,
-                interval_s=3.0,
+                retries=1,
+                interval_s=0.2,
                 settle_s=0.0,
-                check_topic=False,
+                check_topic=True,
             )
         if ok_goal:
             self._record_milestone("goal_published", now, {"entity_id": eid, "goal": goal})
             self._set_navigation_goal_state(eid, goal, now)
-        return bool(ok_goal and ok_trig)
+        if ok_goal and not ok_trig:
+            print(f"[NAVIGATE][WARN] goal published for {eid} but /traj_start_trigger publish failed")
+        return bool(ok_goal)
 
     def _observe_policy(self, stage_id: str) -> Dict[str, Any]:
         st = self.plan.stages[stage_id]
         policy = dict(st.policy or {})
+        observe_verify_min_score = policy.get("observe_verify_min_score", self.verified_cfg.get("min_score", 0.5))
         return {
-            "observe_radius_m": float(policy.get("observe_radius_m", 0.5)),
+            "observe_radius_m": float(policy.get("observe_radius_m", 2.5)),
             "hover_duration_s": float(policy.get("hover_duration_s", 2.0)),
+            "hover_verify_grace_s": float(policy.get("hover_verify_grace_s", 2.0)),
+            "observe_verify_hits_required": int(max(1, policy.get("observe_verify_hits_required", 2))),
+            "observe_verify_min_score": float(observe_verify_min_score),
+            "localization_wait_timeout_s": float(policy.get("localization_wait_timeout_s", 3.0)),
             "rollback_on_fail": bool(policy.get("rollback_on_fail", True)),
+            "goal_retry_interval_s": float(policy.get("goal_retry_interval_s", 1.0)),
+            "goal_publish_timeout_s": float(policy.get("goal_publish_timeout_s", 8.0)),
+            "rollback_goal_retry_interval_s": float(policy.get("rollback_goal_retry_interval_s", 1.0)),
+            "rollback_goal_publish_timeout_s": float(policy.get("rollback_goal_publish_timeout_s", 8.0)),
+            "rollback_timeout_s": float(policy.get("rollback_timeout_s", 20.0)),
+            "rollback_stall_timeout_s": float(policy.get("rollback_stall_timeout_s", 6.0)),
+            "rollback_mux_settle_s": float(policy.get("rollback_mux_settle_s", 0.3)),
+            "rollback_max_retries": int(policy.get("rollback_max_retries", 3)),
         }
 
     def _track_policy(self, stage_id: str) -> Dict[str, Any]:
@@ -835,31 +875,73 @@ class PlanExecutor:
         d = (yaw_a - yaw_b + 180.0) % 360.0 - 180.0
         return abs(d)
 
+    def _observe_fallback_stage_id(self, stage_id: str) -> Optional[str]:
+        st = self.plan.stages[stage_id]
+        policy = dict(st.policy or {})
+        fallback = policy.get("fallback_stage_id")
+        if fallback:
+            fallback = str(fallback)
+            if fallback in self.plan.stages:
+                return fallback
+        return next((sid for sid, stg in self.plan.stages.items() if stg.intent == "SEARCH"), None)
+
     def _start_observe_stage(self, stage_id: str, eid: str, now: float) -> None:
         start_pose = self._read_odom_pose_once()
         if start_pose is None:
             self._observe_state = {"phase": "unavailable", "reason": "odom_unavailable", "started_t": now}
             self._emit_diag(code=DiagnosticCode.NAV_NO_GOAL, message="observe start odom unavailable", now=now, severity="error")
             return
+        policy = self._observe_policy(stage_id)
         goal = self._build_observe_goal(eid, stage_id)
         if goal is None:
-            self._observe_state = {"phase": "unavailable", "reason": "target_localization_unavailable", "started_t": now}
-            self._emit_diag(code=DiagnosticCode.NAV_NO_GOAL, message=f"observe goal unavailable for {eid}", now=now, severity="error")
+            self._observe_state = {
+                "phase": "waiting_for_localization",
+                "reason": "target_localization_pending",
+                "started_t": now,
+                "wait_started_t": now,
+                "wait_timeout_s": float(policy["localization_wait_timeout_s"]),
+                "start_odom_goal": self._goal_dict_from_pose(start_pose),
+                "hover_duration_s": float(policy["hover_duration_s"]),
+                "rollback_on_fail": bool(policy["rollback_on_fail"]),
+                "fallback_stage_id": self._observe_fallback_stage_id(stage_id),
+                "hover_until_t": None,
+                "hover_finished_t": None,
+                "rollback_started_t": None,
+                "policy": policy,
+                "verify_hit_count": 0,
+                "verify_last_det_t": None,
+                "verify_last_score": None,
+            }
+            self._emit_diag(
+                code=DiagnosticCode.NAV_NO_GOAL,
+                message=f"observe goal unavailable for {eid}, waiting for localization",
+                now=now,
+                severity="warn",
+            )
             return
         self._observe_state = {
             "phase": "approach",
             "started_t": now,
             "start_odom_goal": self._goal_dict_from_pose(start_pose),
             "observe_goal": goal,
-            "hover_duration_s": self._observe_policy(stage_id)["hover_duration_s"],
-            "rollback_on_fail": self._observe_policy(stage_id)["rollback_on_fail"],
-            "fallback_stage_id": next((sid for sid, st in self.plan.stages.items() if st.intent == "SEARCH"), None),
+            "hover_duration_s": float(policy["hover_duration_s"]),
+            "rollback_on_fail": bool(policy["rollback_on_fail"]),
+            "fallback_stage_id": self._observe_fallback_stage_id(stage_id),
+            "hover_until_t": None,
             "hover_finished_t": None,
             "rollback_started_t": None,
+            "policy": policy,
+            "verify_hit_count": 0,
+            "verify_last_det_t": None,
+            "verify_last_score": None,
         }
         ok = self._publish_navigation_goal(eid, goal, now, trigger=True)
         self._record_milestone("observe_started", now, {"goal": goal, "ok": ok})
         self._emit_runtime_event("observe_started", now=now, details={"goal": goal, "ok": ok})
+        if not ok:
+            self._observe_state["phase"] = "pending_goal"
+            self._observe_state["pending_goal_started_t"] = now
+            self._observe_state["next_goal_retry_t"] = now + float(policy["goal_retry_interval_s"])
 
     def _target_localization_available(self, eid: str, now: float, stage_id: str) -> bool:
         ent_state = self.world_state.entities.get(eid)
@@ -983,10 +1065,75 @@ class PlanExecutor:
         if stage.intent != "OBSERVE" or self._observe_state is None:
             return False
         phase = self._observe_state.get("phase")
+        policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
         if phase == "unavailable":
             if self._observe_state.get("rollback_on_fail", True):
                 return self._start_observe_rollback(now, reason=str(self._observe_state.get("reason", "unavailable")))
             return False
+        if phase == "waiting_for_localization":
+            goal = self._build_observe_goal(self.active_entity_id, self.stage_id)
+            if goal is not None:
+                self._observe_state["observe_goal"] = goal
+                self._observe_state["reason"] = None
+                ok = self._publish_navigation_goal(self.active_entity_id, goal, now, trigger=True)
+                self._record_milestone("observe_started", now, {"goal": goal, "ok": ok})
+                self._emit_runtime_event("observe_started", now=now, details={"goal": goal, "ok": ok})
+                if ok:
+                    self._observe_state["phase"] = "approach"
+                else:
+                    # EGO-side waypoint generator may still be starting up; retry instead of
+                    # permanently getting stuck in approach without an accepted goal.
+                    self._observe_state["phase"] = "pending_goal"
+                    self._observe_state["pending_goal_started_t"] = now
+                    self._observe_state["next_goal_retry_t"] = now + 1.0
+                return True
+            wait_started = float(self._observe_state.get("wait_started_t") or now)
+            wait_timeout = float(self._observe_state.get("wait_timeout_s") or 0.0)
+            if (now - wait_started) < wait_timeout:
+                return True
+            self._observe_state["phase"] = "unavailable"
+            self._observe_state["reason"] = "target_localization_timeout"
+            self._emit_diag(
+                code=DiagnosticCode.NAV_NO_GOAL,
+                message=f"observe localization timeout for {self.active_entity_id}",
+                now=now,
+                severity="error",
+            )
+            if self._observe_state.get("rollback_on_fail", True):
+                return self._start_observe_rollback(now, reason="target_localization_timeout")
+            return False
+        if phase == "pending_goal":
+            goal = self._observe_state.get("observe_goal")
+            if not isinstance(goal, dict):
+                self._observe_state["phase"] = "unavailable"
+                self._observe_state["reason"] = "observe_goal_missing"
+                return True
+            pending_started = float(self._observe_state.get("pending_goal_started_t") or now)
+            next_retry_t = float(self._observe_state.get("next_goal_retry_t") or now)
+            if now >= next_retry_t:
+                ok = self._publish_navigation_goal(self.active_entity_id, goal, now, trigger=True)
+                self._record_milestone("observe_goal_retry", now, {"goal": goal, "ok": ok})
+                self._emit_runtime_event("observe_goal_retry", now=now, details={"goal": goal, "ok": ok})
+                if ok:
+                    self._observe_state["phase"] = "approach"
+                    self._observe_state["reason"] = None
+                    self._observe_state.pop("pending_goal_started_t", None)
+                    self._observe_state.pop("next_goal_retry_t", None)
+                    return True
+                self._observe_state["next_goal_retry_t"] = now + float(policy["goal_retry_interval_s"])
+            if (now - pending_started) >= float(policy["goal_publish_timeout_s"]):
+                self._observe_state["phase"] = "unavailable"
+                self._observe_state["reason"] = "observe_goal_publish_timeout"
+                self._emit_diag(
+                    code=DiagnosticCode.NAV_NO_GOAL,
+                    message=f"observe goal publish timeout for {self.active_entity_id}",
+                    now=now,
+                    severity="error",
+                )
+                if self._observe_state.get("rollback_on_fail", True):
+                    return self._start_observe_rollback(now, reason="observe_goal_publish_timeout")
+                return False
+            return True
         if phase == "approach":
             if self._current_goal_reached():
                 self._record_milestone("observe_goal_reached", now, {"goal": self._observe_state.get("observe_goal")})
@@ -994,17 +1141,56 @@ class PlanExecutor:
                 if self.hold_topic:
                     self._mux_select(self.hold_topic)
                     self._publish_hold_for(float(self._observe_state.get("hover_duration_s", 2.0)))
-                self._observe_state["phase"] = "hover_done"
-                self._observe_state["hover_finished_t"] = time.time()
-                self._record_milestone("observe_hover_finished", self._observe_state["hover_finished_t"], {"duration_s": self._observe_state.get("hover_duration_s", 2.0)})
-                self._emit_runtime_event("observe_hover_finished", now=self._observe_state["hover_finished_t"], details={"duration_s": self._observe_state.get("hover_duration_s", 2.0)})
+                self._observe_state["phase"] = "hovering"
+                self._observe_state["hover_until_t"] = now + float(self._observe_state.get("hover_duration_s", 2.0))
+                return True
+            return True
+        if phase == "hovering":
+            hover_until = float(self._observe_state.get("hover_until_t") or 0.0)
+            if now < hover_until:
+                return True
+            self._observe_state["phase"] = "hover_done"
+            self._observe_state["hover_finished_t"] = now
+            self._observe_state["hover_verify_grace_until_t"] = now + float(policy.get("hover_verify_grace_s", 2.0))
+            self._record_milestone("observe_hover_finished", now, {"duration_s": self._observe_state.get("hover_duration_s", 2.0)})
+            self._emit_runtime_event("observe_hover_finished", now=now, details={"duration_s": self._observe_state.get("hover_duration_s", 2.0)})
             return True
         if phase == "hover_done":
-            if criteria.get("success_met"):
+            semantic_gate = self._semantic_observe_gate_result()
+            if self._is_entity_verified(self.active_entity_id) or self._observe_hits_satisfied() or semantic_gate == "supported":
                 self._observe_state["phase"] = "complete"
-                self._record_milestone("observe_supported", now, {})
-                self._emit_runtime_event("observe_supported", now=now, details={})
+                details = {
+                    "verified": self._is_entity_verified(self.active_entity_id),
+                    "observe_verify_hit_count": int(self._observe_state.get("verify_hit_count") or 0),
+                    "observe_verify_hits_required": int(max(1, policy.get("observe_verify_hits_required", 2))),
+                    "observe_verify_last_score": self._observe_state.get("verify_last_score"),
+                    "semantic_gate": semantic_gate,
+                }
+                self._record_milestone("observe_supported", now, details)
+                self._emit_runtime_event("observe_supported", now=now, details=details)
+                if not self.plan.outgoing(self.stage_id):
+                    self._request_stop(f"observe completed at {self.stage_id}")
+                    return True
                 return False
+            if semantic_gate == "rejected":
+                ent = self.world_state.entities.get(self.active_entity_id)
+                self._emit_diag(
+                    code=DiagnosticCode.SEMANTIC_NOT_SUPPORTED,
+                    message="semantic observe gate rejected current target evidence",
+                    now=now,
+                    severity="info",
+                    details={
+                        "entity_id": self.active_entity_id,
+                        "confidence": None if ent is None else ent.semantic_verify_confidence,
+                        "status": None if ent is None else ent.semantic_verify_status,
+                    },
+                )
+                if self._observe_state.get("rollback_on_fail", True):
+                    return self._start_observe_rollback(now, reason="semantic_observe_rejected")
+                return False
+            grace_until = float(self._observe_state.get("hover_verify_grace_until_t") or 0.0)
+            if now < grace_until:
+                return True
             if self._observe_state.get("rollback_on_fail", True):
                 return self._start_observe_rollback(now, reason="observe_inconclusive")
             return False
@@ -1021,22 +1207,174 @@ class PlanExecutor:
                     return True
                 self._request_stop("observe rollback completed")
                 return True
+            nav = self._nav_goal_state or {}
+            rollback_goal = self._observe_state.get("start_odom_goal")
+            rollback_started = float(self._observe_state.get("rollback_started_t") or now)
+            rollback_retries = int(self._observe_state.get("rollback_retry_count") or 0)
+            last_publish_t = float(self._observe_state.get("rollback_goal_last_publish_t") or rollback_started)
+            if not nav and isinstance(rollback_goal, dict):
+                if rollback_retries < int(policy["rollback_max_retries"]) and (now - last_publish_t) >= float(policy["rollback_goal_retry_interval_s"]):
+                    return self._retry_observe_rollback_goal(now, rollback_goal, reason="rollback_goal_state_missing")
+            elif nav:
+                initial_distance = nav.get("initial_distance")
+                last_distance = nav.get("last_distance")
+                goal_published_t = float(nav.get("goal_published_t") or rollback_started)
+                progress = None
+                if initial_distance is not None and last_distance is not None:
+                    progress = float(initial_distance) - float(last_distance)
+                if (
+                    progress is not None
+                    and progress < float(self.min_motion_progress_m)
+                    and (now - goal_published_t) >= float(policy["rollback_stall_timeout_s"])
+                    and isinstance(rollback_goal, dict)
+                ):
+                    if rollback_retries < int(policy["rollback_max_retries"]) and (now - last_publish_t) >= float(policy["rollback_goal_retry_interval_s"]):
+                        self._emit_diag(
+                            code=DiagnosticCode.NAV_STALLED,
+                            message="observe rollback stalled, retrying rollback goal",
+                            now=now,
+                            severity="warn",
+                            details={"progress_m": progress, "distance_m": last_distance},
+                        )
+                        return self._retry_observe_rollback_goal(now, rollback_goal, reason="rollback_nav_stalled")
+            if (now - rollback_started) >= float(policy["rollback_timeout_s"]):
+                self._record_milestone(
+                    "observe_rollback_timeout",
+                    now,
+                    {
+                        "goal": rollback_goal,
+                        "elapsed_s": now - rollback_started,
+                        "retry_count": rollback_retries,
+                    },
+                )
+                self._emit_runtime_event(
+                    "observe_rollback_timeout",
+                    now=now,
+                    details={
+                        "goal": rollback_goal,
+                        "elapsed_s": now - rollback_started,
+                        "retry_count": rollback_retries,
+                    },
+                )
+                self._emit_diag(
+                    code=DiagnosticCode.NAV_STALLED,
+                    message="observe rollback timeout, forcing stage fallback",
+                    now=now,
+                    severity="error",
+                    details={"retry_count": rollback_retries},
+                )
+                return self._finish_observe_rollback_without_reaching(now, reason="rollback_timeout")
+            return True
+        if phase == "rollback_pending_goal":
+            rollback_goal = self._observe_state.get("start_odom_goal")
+            if not isinstance(rollback_goal, dict):
+                return self._finish_observe_rollback_without_reaching(now, reason="rollback_goal_missing")
+            pending_since = float(self._observe_state.get("rollback_pending_since_t") or now)
+            next_retry_t = float(self._observe_state.get("rollback_next_retry_t") or now)
+            if now >= next_retry_t:
+                return self._retry_observe_rollback_goal(now, rollback_goal, reason="rollback_goal_publish_retry")
+            if (now - pending_since) >= float(policy["rollback_goal_publish_timeout_s"]):
+                self._record_milestone(
+                    "observe_rollback_publish_timeout",
+                    now,
+                    {"goal": rollback_goal, "retry_count": int(self._observe_state.get("rollback_retry_count") or 0)},
+                )
+                self._emit_runtime_event(
+                    "observe_rollback_publish_timeout",
+                    now=now,
+                    details={"goal": rollback_goal, "retry_count": int(self._observe_state.get("rollback_retry_count") or 0)},
+                )
+                self._emit_diag(
+                    code=DiagnosticCode.NAV_NO_GOAL,
+                    message="observe rollback goal publish timeout, forcing stage fallback",
+                    now=now,
+                    severity="error",
+                )
+                return self._finish_observe_rollback_without_reaching(now, reason="rollback_goal_publish_timeout")
             return True
         return False
 
     def _start_observe_rollback(self, now: float, *, reason: str) -> bool:
         if self._observe_state is None:
             return False
-        if self._observe_state.get("phase") == "rollback":
+        if self._observe_state.get("phase") in ("rollback", "rollback_pending_goal"):
             return True
         rollback_goal = self._observe_state.get("start_odom_goal")
         if not isinstance(rollback_goal, dict):
             return False
-        self._observe_state["phase"] = "rollback"
+        policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
+        self._nav_goal_state = None
         self._observe_state["rollback_started_t"] = now
+        self._observe_state["rollback_reason"] = reason
+        self._observe_state["rollback_retry_count"] = int(self._observe_state.get("rollback_retry_count") or 0)
+        # Hovering switches mux to hold; rollback must explicitly hand control back
+        # to the navigation source before publishing the return goal.
+        self._select_intent_source("OBSERVE")
+        settle_s = max(0.0, float(policy.get("rollback_mux_settle_s", 0.0)))
+        if settle_s > 1e-3:
+            time.sleep(min(settle_s, 1.0))
         ok = self._publish_navigation_goal(self.active_entity_id, rollback_goal, now, trigger=True)
+        self._observe_state["rollback_goal_last_publish_t"] = now
+        if ok:
+            self._observe_state["phase"] = "rollback"
+        else:
+            self._observe_state["phase"] = "rollback_pending_goal"
+            self._observe_state["rollback_pending_since_t"] = now
+            self._observe_state["rollback_next_retry_t"] = now + float(policy["rollback_goal_retry_interval_s"])
         self._record_milestone("observe_rollback_started", now, {"goal": rollback_goal, "reason": reason, "ok": ok})
         self._emit_runtime_event("observe_rollback_started", now=now, details={"goal": rollback_goal, "reason": reason, "ok": ok})
+        return True
+
+    def _retry_observe_rollback_goal(self, now: float, rollback_goal: Dict[str, Any], *, reason: str) -> bool:
+        if self._observe_state is None:
+            return False
+        policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
+        retries = int(self._observe_state.get("rollback_retry_count") or 0) + 1
+        self._observe_state["rollback_retry_count"] = retries
+        self._observe_state["rollback_goal_last_publish_t"] = now
+        self._select_intent_source("OBSERVE")
+        settle_s = max(0.0, float(policy.get("rollback_mux_settle_s", 0.0)))
+        if settle_s > 1e-3:
+            time.sleep(min(settle_s, 1.0))
+        ok = self._publish_navigation_goal(self.active_entity_id, rollback_goal, now, trigger=True)
+        self._record_milestone(
+            "observe_rollback_goal_retry",
+            now,
+            {"goal": rollback_goal, "reason": reason, "retry_count": retries, "ok": ok},
+        )
+        self._emit_runtime_event(
+            "observe_rollback_goal_retry",
+            now=now,
+            details={"goal": rollback_goal, "reason": reason, "retry_count": retries, "ok": ok},
+        )
+        if ok:
+            self._observe_state["phase"] = "rollback"
+            self._observe_state.pop("rollback_pending_since_t", None)
+            self._observe_state.pop("rollback_next_retry_t", None)
+        else:
+            self._observe_state["phase"] = "rollback_pending_goal"
+            if self._observe_state.get("rollback_pending_since_t") is None:
+                self._observe_state["rollback_pending_since_t"] = now
+            self._observe_state["rollback_next_retry_t"] = now + float(policy["rollback_goal_retry_interval_s"])
+        return True
+
+    def _finish_observe_rollback_without_reaching(self, now: float, *, reason: str) -> bool:
+        if self._observe_state is None:
+            return False
+        target = self._observe_state.get("fallback_stage_id")
+        self._record_milestone("observe_rollback_aborted", now, {"reason": reason, "target_stage": target})
+        self._emit_runtime_event(
+            "observe_rollback_aborted",
+            now=now,
+            details={"reason": reason, "target_stage": target},
+        )
+        if target and target != self.stage_id:
+            self._transition_to(
+                target,
+                Transition(fr=self.stage_id, to=target, when={"type": "OBSERVE_ROLLBACK_ABORT", "params": {"reason": reason}}),
+            )
+            return True
+        self._request_stop(f"observe rollback aborted: {reason}")
         return True
 
     # ---------------- observation ingestion ----------------
@@ -1051,9 +1389,67 @@ class PlanExecutor:
             return det
         self.bb.update_detection(self.active_entity_id, det)
         self.world_state.ingest_detection(det, default_entity_id=self.active_entity_id, source="primary")
+        self._update_observe_verify_hits(det)
         if det.found:
             self._record_milestone("primary_detected", now, {"score": det.score})
         return det
+
+    def _update_observe_verify_hits(self, det: Detection) -> None:
+        if self._observe_state is None:
+            return
+        stage = self.plan.stages.get(self.stage_id)
+        if stage is None or stage.intent != "OBSERVE":
+            return
+        if not det.found:
+            return
+        if det.entity_id is not None and det.entity_id != self.active_entity_id:
+            return
+        if det.req_id is not None and self.current_req_id is not None and det.req_id != self.current_req_id:
+            return
+        if det.role is not None and det.role != "primary":
+            return
+        policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
+        min_score = float(policy.get("observe_verify_min_score", self.verified_cfg.get("min_score", 0.5)))
+        if float(det.score or 0.0) < min_score:
+            return
+        t_det = float(det.t_wall)
+        last_t = self._observe_state.get("verify_last_det_t")
+        if last_t is not None and t_det <= float(last_t) + 1e-6:
+            return
+        self._observe_state["verify_last_det_t"] = t_det
+        self._observe_state["verify_hit_count"] = int(self._observe_state.get("verify_hit_count") or 0) + 1
+        self._observe_state["verify_last_score"] = float(det.score or 0.0)
+
+    def _observe_hits_satisfied(self) -> bool:
+        if self._observe_state is None:
+            return False
+        policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
+        required_hits = int(max(1, policy.get("observe_verify_hits_required", 2)))
+        return int(self._observe_state.get("verify_hit_count") or 0) >= required_hits
+
+    def _semantic_observe_gate_result(self) -> Optional[str]:
+        if not self.semantic_observe_gate_enabled:
+            return None
+        stage = self.plan.stages.get(self.stage_id)
+        if stage is None or stage.intent != "OBSERVE":
+            return None
+        ent = self.world_state.entities.get(self.active_entity_id)
+        if ent is None:
+            return None
+        status = str(ent.semantic_verify_status or "").strip().lower()
+        conf = max(0.0, min(1.0, float(ent.semantic_verify_confidence or 0.0)))
+        if status in self.semantic_observe_success_statuses and conf >= self.semantic_observe_success_conf_min:
+            self.world_state.set_entity_verification(
+                self.active_entity_id,
+                VerificationStatus.VERIFIED,
+                note=f"semantic observe gate supported ({conf:.2f})",
+            )
+            self.world_state.set_stage_verification(self.stage_id, VerificationStatus.VERIFIED)
+            return "supported"
+        if status in self.semantic_observe_failure_statuses and conf >= self.semantic_observe_failure_conf_min:
+            self.world_state.set_stage_verification(self.stage_id, VerificationStatus.CONTRADICTED)
+            return "rejected"
+        return None
 
     def _ingest_cue_detection(self, now: float) -> Optional[Detection]:
         if self.cue_reader is None:
@@ -1173,11 +1569,12 @@ class PlanExecutor:
 
         success_met = bool(stage.success_criteria) and all(e["ok"] for e in success_evals)
         failure_met = any(e["ok"] for e in failure_evals)
+        skill_managed_stage = stage.intent in ("OBSERVE", "TRACK")
 
-        if success_met:
+        if success_met and not skill_managed_stage:
             if self._record_milestone("stage_success", now):
                 self._emit_runtime_event("stage_success", now=now)
-        if failure_met:
+        if failure_met and not skill_managed_stage:
             if self._record_milestone("stage_failed", now):
                 self._emit_runtime_event("stage_failure", now=now)
             self._emit_diag(
@@ -1258,14 +1655,31 @@ class PlanExecutor:
         stage_state = self._get_stage_state()
         if stage_state is None:
             return False
+        stage = self.plan.stages[self.stage_id]
         if (now - self.stage_enter_t) < self.semantic_min_stage_dwell_s:
             return False
-        if stage_state.last_semantic_verify_t is not None and (now - stage_state.last_semantic_verify_t) < self.semantic_cooldown_s:
+        force_observe_verify = False
+        if (
+            self.semantic_observe_gate_enabled
+            and self.semantic_observe_trigger_after_hover
+            and stage.intent == "OBSERVE"
+            and self._observe_state is not None
+            and self._observe_state.get("phase") == "hover_done"
+        ):
+            hover_finished_t = self._observe_state.get("hover_finished_t")
+            if hover_finished_t is not None:
+                last_t = stage_state.last_semantic_verify_t
+                if last_t is None or float(last_t) + 1e-3 < float(hover_finished_t):
+                    force_observe_verify = True
+        if (not force_observe_verify) and stage_state.last_semantic_verify_t is not None and (now - stage_state.last_semantic_verify_t) < self.semantic_cooldown_s:
             return False
 
         ent = self.world_state.entities.get(self.active_entity_id)
         if ent is None or ent.last_primary_detection is None:
             return False
+
+        if force_observe_verify:
+            return True
 
         if criteria.get("failure_met") and self.semantic_trigger_on_failure:
             return True
@@ -1304,9 +1718,11 @@ class PlanExecutor:
                 }
             )
 
-        if ent.proposal_status == "multi_candidate_ambiguous":
+        if stage.intent == "OBSERVE":
+            query_type = "observe_verify"
+        elif ent.proposal_status == "multi_candidate_ambiguous":
             query_type = "ambiguity_resolve"
-        elif stage.relations:
+        elif self.plan.relations:
             query_type = "relation_verify"
         else:
             query_type = "candidate_verify"
@@ -1384,6 +1800,7 @@ class PlanExecutor:
             return False
 
         result = response.result
+        stage = self.plan.stages[self.stage_id]
         self.world_state.set_entity_semantic_verification(
             self.active_entity_id,
             status=result.verify_status,
@@ -1398,6 +1815,16 @@ class PlanExecutor:
 
         if stage_state is not None:
             stage_state.last_semantic_followup = result.recommended_followup
+
+        if stage.intent == "SEARCH" and self.perception_request_path:
+            ent_plan = self.plan.entities.get(self.active_entity_id)
+            self._rewrite_perception_request(
+                stage_id=self.stage_id,
+                primary_entity_id=self.active_entity_id,
+                prompt="" if ent_plan is None else (ent_plan.prompt or ""),
+                cue_order=self._ordered_cue_targets(self.stage_id),
+                now=now,
+            )
 
         if result.verify_status in ("supported", "verified"):
             self._record_milestone("semantic_verify_supported", now, {"confidence": result.verification_confidence})
@@ -1452,12 +1879,47 @@ class PlanExecutor:
             return False
         if self.semantic_allow_followups and followup not in self.semantic_allow_followups:
             return False
+        stage = self.plan.stages.get(self.stage_id)
+        if stage is not None and stage.intent == "SEARCH":
+            if followup in ("hold_and_reobserve", "insert_verify_stage"):
+                self._emit_runtime_event(
+                    "semantic_followup_skipped",
+                    now=now,
+                    details={
+                        "followup": followup,
+                        "reason": "search_stage_prefers_continue",
+                    },
+                )
+                return False
+            if followup in ("retry_same_stage", "fallback_to_search"):
+                self._emit_runtime_event(
+                    "semantic_followup_skipped",
+                    now=now,
+                    details={
+                        "followup": followup,
+                        "reason": "search_stage_already_searching",
+                    },
+                )
+                return False
 
         if followup == "continue":
             return False
 
         if followup == "hold_and_reobserve":
+            hold_count = int(self._semantic_hold_counts.get(self.stage_id, 0))
+            if hold_count >= 2:
+                self._emit_runtime_event(
+                    "semantic_followup_skipped",
+                    now=now,
+                    details={
+                        "followup": followup,
+                        "reason": "hold_limit_reached",
+                        "hold_count": hold_count,
+                    },
+                )
+                return False
             if self.hold_topic:
+                self._semantic_hold_counts[self.stage_id] = hold_count + 1
                 self._mux_select(self.hold_topic)
                 self._publish_hold_for(self.recovery.hold_reobserve_s)
                 return True
@@ -1689,6 +2151,15 @@ class PlanExecutor:
                 time.sleep(self.tick_dt)
         except KeyboardInterrupt:
             print("PlanExecutor interrupted.")
+        except Exception as e:
+            traceback.print_exc()
+            self._emit_runtime_event(
+                "runtime_exception",
+                now=time.time(),
+                details={"error": repr(e), "stage_id": self.stage_id, "intent": self.plan.stages[self.stage_id].intent},
+            )
+            self._terminal_reason = f"runtime exception: {e}"
+            self._stop_requested = True
         finally:
             self._exit_stage(self.stage_id)
             self._emit_runtime_event(
@@ -1722,10 +2193,6 @@ class PlanExecutor:
         self._update_navigation_progress(now)
         verifier_results = self._evaluate_verifiers(now)
         criteria = self._evaluate_stage_criteria(now)
-        self._maybe_run_semantic_verifier(now, verifier_results, criteria)
-        observe_active = self._drive_observe_stage(now, criteria)
-        track_active = self._drive_track_stage(now, criteria)
-
         outs = self.plan.outgoing(self.stage_id)
         fired: Optional[Transition] = None
         transition_evals = []
@@ -1734,6 +2201,28 @@ class PlanExecutor:
             transition_evals.append({"to": tr.to, "when": tr.when, "ok": ok, "error": err})
             if ok and fired is None:
                 fired = tr
+
+        # SEARCH stages should hand off immediately once a transition condition is met.
+        # Running the semantic verifier first can block for several seconds, which makes
+        # the detection evidence stale and causes the second PERCEPTION_FOUND evaluation
+        # to drop back to false before the transition is applied.
+        if stage.intent not in ("OBSERVE", "TRACK") and fired is not None:
+            snap = self._build_runtime_snapshot(
+                now=now,
+                primary_det=primary_det,
+                cue_det=cue_det,
+                localization=localization,
+                transition_evals=transition_evals,
+                verifier_results=verifier_results,
+                criteria=criteria,
+            )
+            self._log(snap)
+            self._transition_to(fired.to, fired)
+            return
+
+        self._maybe_run_semantic_verifier(now, verifier_results, criteria)
+        observe_active = self._drive_observe_stage(now, criteria)
+        track_active = self._drive_track_stage(now, criteria)
 
         if verify_window_active or observe_active or track_active:
             for tr_eval in transition_evals:
@@ -1762,6 +2251,9 @@ class PlanExecutor:
 
         if fired is not None:
             self._transition_to(fired.to, fired)
+            return
+
+        if verify_window_active or observe_active or track_active:
             return
 
         if criteria["failure_met"]:
@@ -1947,7 +2439,7 @@ class PlanExecutor:
             "outgoing": transition_evals,
         }
 
-    def _make_stage_ctx(self, stage_id: str) -> Dict[str, Any]:
+    def _make_stage_ctx(self, stage_id: str, *, include_launch_overrides: bool = True) -> Dict[str, Any]:
         st = self.plan.stages[stage_id]
         eid = st.primary_targets[0]
         ent = self.plan.entities.get(eid)
@@ -1956,6 +2448,7 @@ class PlanExecutor:
             "prompt": None if ent is None else ent.prompt,
             "extra": {} if ent is None else ent.extra,
         }
+        launch_overrides = self._stage_launch_overrides(stage_id) if include_launch_overrides else {}
         return {
             "stage_id": stage_id,
             "intent": st.intent,
@@ -1964,6 +2457,7 @@ class PlanExecutor:
             "entity": entity,
             "policy": st.policy,
             "budget": st.budget,
+            "launch_overrides": launch_overrides,
             "skill_contract": None if self._stage_skill_contract(stage_id) is None else self._stage_skill_contract(stage_id).to_dict(),
             "relations": [
                 {
@@ -1978,11 +2472,62 @@ class PlanExecutor:
             "open_questions": self.plan.open_questions,
         }
 
+    def _stage_launch_overrides(self, stage_id: str) -> Dict[str, Any]:
+        st = self.plan.stages[stage_id]
+        policy = st.policy or {}
+        if st.intent != "SEARCH":
+            return {}
+
+        restart_from_current_pose = bool(
+            policy.get("search_restart_from_current_pose")
+            or policy.get("restart_from_current_pose")
+            or policy.get("inherit_current_pose_on_enter")
+        )
+        if not restart_from_current_pose:
+            return {}
+
+        pose = self._read_odom_pose_once()
+        if pose is None:
+            print(f"[SEARCH][WARN] policy requested restart-from-current-pose for {stage_id}, but odom is unavailable")
+            return {}
+
+        x, y, z, yaw = pose
+        z_offset = float(policy.get("search_restart_z_offset_m", 0.0) or 0.0)
+        z_floor = policy.get("search_restart_min_z_m")
+        z_ceiling = policy.get("search_restart_max_z_m")
+        target_z = z + z_offset
+        if z_floor is not None:
+            target_z = max(target_z, float(z_floor))
+        if z_ceiling is not None:
+            target_z = min(target_z, float(z_ceiling))
+
+        yaw_mode = str(policy.get("search_restart_yaw_mode", "inherit")).strip().lower()
+        if yaw_mode == "zero":
+            target_yaw = 0.0
+        elif yaw_mode == "fixed":
+            target_yaw = float(policy.get("search_restart_fixed_yaw", 0.0) or 0.0)
+        else:
+            target_yaw = yaw
+
+        overrides = {
+            "init_x": round(x, 4),
+            "init_y": round(y, 4),
+            "init_z": round(target_z, 4),
+            "init_yaw": round(target_yaw, 4),
+        }
+        print(
+            f"[SEARCH] restarting {stage_id} from current pose "
+            f"x={overrides['init_x']:.2f} y={overrides['init_y']:.2f} "
+            f"z={overrides['init_z']:.2f} yaw={overrides['init_yaw']:.2f}"
+        )
+        return overrides
+
     def _retry_current_stage(self) -> None:
         print(f"[Recovery] retrying stage {self.stage_id}")
         self._exit_stage(self.stage_id)
         self.stage_enter_t = time.time()
         self.bb.reset_entity(self.active_entity_id)
+        self._semantic_hold_counts[self.stage_id] = 0
         self._enter_stage(self.stage_id)
 
     def _transition_to(self, next_stage_id: str, fired: Transition):
@@ -2009,6 +2554,7 @@ class PlanExecutor:
         self.stage_enter_t = time.time()
         self.active_entity_id = self.plan.stages[self.stage_id].primary_targets[0]
         self.bb.reset_entity(self.active_entity_id)
+        self._semantic_hold_counts[self.stage_id] = 0
         self._current_recovery = None
         self._nav_goal_state = None
         self._enter_stage(self.stage_id)
@@ -2019,6 +2565,7 @@ class PlanExecutor:
         eid = st.primary_targets[0]
         ent = self.plan.entities[eid]
         prompt = ent.prompt or ""
+        self._semantic_hold_counts[stage_id] = 0
 
         self.prompt_ctl.set_prompt(prompt)
         self._record_milestone("prompt_written", now, {"entity_id": eid})
@@ -2063,14 +2610,24 @@ class PlanExecutor:
         stage_state = self.world_state.begin_stage(stage_id, st.intent, now)
         stage_state.retry_count = self._stage_retry_counts.get(stage_id, 0)
         stage_state.current_skill_id = self._stage_skill_id(stage_id)
+        stage_ctx = self._make_stage_ctx(stage_id)
         self._record_milestone("stage_entered", now, {"intent": st.intent, "entity_id": eid})
-        self._emit_runtime_event("stage_enter", now=now, details={"intent": st.intent, "entity_id": eid, "req_id": self.current_req_id})
+        self._emit_runtime_event(
+            "stage_enter",
+            now=now,
+            details={
+                "intent": st.intent,
+                "entity_id": eid,
+                "req_id": self.current_req_id,
+                "launch_overrides": stage_ctx.get("launch_overrides") or {},
+            },
+        )
 
         print(f"[StageEnter] {stage_id} intent={st.intent} entity={eid} prompt={prompt!r} req_id={self.current_req_id}")
 
         ad = self.adapters.get(st.intent)
         if ad:
-            ad.enter(self._make_stage_ctx(stage_id))
+            ad.enter(stage_ctx)
             self.world_state.set_stage_skill(stage_id, self._stage_skill_id(stage_id), "running")
             self._record_milestone("skill_entered", now, {"intent": st.intent})
             self._emit_runtime_event(
@@ -2125,7 +2682,7 @@ class PlanExecutor:
         self._emit_runtime_event("stage_exit", now=time.time(), details={"intent": st.intent})
         ad = self.adapters.get(st.intent)
         if ad:
-            ad.exit(self._make_stage_ctx(stage_id))
+            ad.exit(self._make_stage_ctx(stage_id, include_launch_overrides=False))
         self.world_state.set_stage_skill(stage_id, skill_id, "stopped")
         if skill_id:
             self._emit_runtime_event("skill_stopped", now=time.time(), details={"skill_id": skill_id, "intent": st.intent, "stage_id": stage_id})

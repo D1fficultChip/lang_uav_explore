@@ -1,9 +1,9 @@
 uav_model:
   dynamics_parameters:
-    max_linear_velocity: 0.5
-    max_linear_acceleration: 0.5
-    max_yaw_velocity: 1.57079632679     # 90 deg / s
-    max_yaw_acceleration: 1.57079632679 # 90 deg / s^2
+    max_linear_velocity: 0.8
+    max_linear_acceleration: 0.6
+    max_yaw_velocity: 0.3490658504      # 20 deg / s
+    max_yaw_acceleration: 0.3490658504  # 20 deg / s^2
 
   sensing_parameters:
     camera_intrinsics:

@@ -118,6 +118,9 @@ class APISemanticVerifier(BaseSemanticVerifier):
             "insert_verify_stage, switch_cue_priority, fallback_to_search, none. "
             "For supports_relation, use weak/medium/strong/none for each relation key. "
             "Be conservative: if evidence is insufficient, return inconclusive rather than supported. "
+            "Write natural-language fields such as explanation and failure_hypothesis in Chinese, "
+            "unless an English technical term is clearly necessary. "
+            "Keep JSON keys and enumerated control values in English exactly as specified. "
             "Do not output prose outside JSON."
         )
 

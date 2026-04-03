@@ -9,6 +9,7 @@ project(perception_bridge)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
+  gazebo_msgs
   geometry_msgs
   nav_msgs
   rospy
@@ -106,7 +107,7 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-  CATKIN_DEPENDS cv_bridge geometry_msgs nav_msgs rospy sensor_msgs std_msgs
+  CATKIN_DEPENDS cv_bridge gazebo_msgs geometry_msgs nav_msgs rospy sensor_msgs std_msgs
 )
 
 ###########
@@ -160,11 +161,13 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
+  scripts/camera_odom_from_odom.py
   scripts/frame_dumper.py
   scripts/hold_publisher.py
   scripts/json_publisher.py
   scripts/pose_follower.py
   scripts/prompt_writer.py
+  scripts/sensor_pose_from_odom.py
   scripts/target_localizer_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
@@ -191,11 +194,11 @@ catkin_install_python(PROGRAMS
 # )
 
 ## Mark other files for installation (e.g. launch and bag files, etc.)
-# install(FILES
-#   # myfile1
-#   # myfile2
-#   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-# )
+install(DIRECTORY
+  launch
+  models
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
 
 #############
 ## Testing ##

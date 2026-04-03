@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import json
 import math
 import os
@@ -33,6 +34,16 @@ class OdomState:
     frame_id: str
 
 
+@dataclass
+class CameraModel:
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+
+
 class TargetLocalizerNode:
     def __init__(self) -> None:
         self.shared_dir = rospy.get_param("~shared_dir", "/shared")
@@ -42,9 +53,9 @@ class TargetLocalizerNode:
         )
         self.mask_default = rospy.get_param("~mask_path", os.path.join(self.shared_dir, "infer_mask.png"))
 
-        self.depth_topic = rospy.get_param("~depth_topic", "/camera/depth/image_raw")
-        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/camera/depth/camera_info")
-        self.odom_topic = rospy.get_param("~odom_topic", "/ekf/ekf_odom")
+        self.depth_topic = rospy.get_param("~depth_topic", "/uav_simulator/depth_camera/depth/image_raw")
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/uav_simulator/depth_camera/depth/camera_info")
+        self.odom_topic = rospy.get_param("~odom_topic", "/uav_simulator/odometry_norm")
         self.result_topic = rospy.get_param("~result_topic", "/perception/target_localization")
         self.world_pose_topic = rospy.get_param("~world_pose_topic", "/perception/target_pose_world")
         self.body_point_topic = rospy.get_param("~body_point_topic", "/perception/target_point_body")
@@ -56,22 +67,34 @@ class TargetLocalizerNode:
         self.max_depth_m = float(rospy.get_param("~max_depth_m", 15.0))
         self.min_support_pixels = int(rospy.get_param("~min_support_pixels", 50))
         self.depth_cluster_tol_m = float(rospy.get_param("~depth_cluster_tol_m", 0.35))
-        self.cache_size = int(rospy.get_param("~cache_size", 30))
+        self.max_body_range_m = float(rospy.get_param("~max_body_range_m", 12.0))
+        self.max_body_height_abs_m = float(rospy.get_param("~max_body_height_abs_m", 2.5))
+        legacy_cache_size = int(rospy.get_param("~cache_size", 30))
+        self.depth_cache_size = int(rospy.get_param("~depth_cache_size", max(legacy_cache_size, 60)))
+        self.odom_cache_size = int(rospy.get_param("~odom_cache_size", max(legacy_cache_size, 3000)))
         self.depth_scale = float(rospy.get_param("~depth_scale", 0.001))
 
-        self.camera_to_body_translation = np.asarray(
-            rospy.get_param("~camera_to_body_translation", [0.0, 0.0, 0.0]), dtype=np.float64
+        self.camera_to_body_translation = self._vector_param(
+            "~camera_to_body_translation", [0.10, 0.0, 0.05], expected_len=3
         )
-        self.camera_to_body_quat = np.asarray(
-            rospy.get_param("~camera_to_body_quaternion", [0.0, 0.0, 0.0, 1.0]), dtype=np.float64
+        self.camera_to_body_quat = self._vector_param(
+            "~camera_to_body_quaternion", [0.5, -0.5, 0.5, -0.5], expected_len=4
         )
         self.target_frame = str(rospy.get_param("~target_frame", "world"))
         self.body_frame = str(rospy.get_param("~body_frame", "base_link"))
 
         self.bridge = CvBridge()
-        self.depth_cache: Deque[DepthFrame] = deque(maxlen=max(3, self.cache_size))
-        self.odom_cache: Deque[OdomState] = deque(maxlen=max(3, self.cache_size))
+        self.depth_cache: Deque[DepthFrame] = deque(maxlen=max(3, self.depth_cache_size))
+        self.odom_cache: Deque[OdomState] = deque(maxlen=max(3, self.odom_cache_size))
         self.camera_info: Optional[CameraInfo] = None
+        self.camera_model_fallback = CameraModel(
+            width=int(rospy.get_param("~camera_width", 640)),
+            height=int(rospy.get_param("~camera_height", 480)),
+            fx=float(rospy.get_param("~camera_fx", 320.0)),
+            fy=float(rospy.get_param("~camera_fy", 320.0)),
+            cx=float(rospy.get_param("~camera_cx", 320.0)),
+            cy=float(rospy.get_param("~camera_cy", 240.0)),
+        )
         self._infer_mtime: float = -1.0
 
         self.result_pub = rospy.Publisher(self.result_topic, String, queue_size=5)
@@ -183,10 +206,6 @@ class TargetLocalizerNode:
         if not bool(infer.get("mask_used", False)):
             base["failure_reason"] = "mask_unavailable"
             return base
-        if self.camera_info is None:
-            base["failure_reason"] = "camera_info_unavailable"
-            return base
-
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             base["failure_reason"] = "mask_file_missing"
@@ -211,7 +230,8 @@ class TargetLocalizerNode:
             base["failure_reason"] = "insufficient_mask_support"
             return base
 
-        point_camera = self._mask_to_camera_point(mask_bool, depth.image_m, self.camera_info)
+        camera_model = self._camera_model()
+        point_camera = self._mask_to_camera_point(mask_bool, depth.image_m, camera_model)
         if point_camera is None:
             base["failure_reason"] = "projection_failed"
             return base
@@ -221,6 +241,9 @@ class TargetLocalizerNode:
             self.camera_to_body_translation,
             self.camera_to_body_quat,
         )
+        if not self._body_point_is_plausible(point_body):
+            base["failure_reason"] = "body_point_implausible"
+            return base
         point_world = self._transform_point(point_body, odom.position, odom.quat_xyzw)
 
         confidence = self._estimate_confidence(
@@ -288,8 +311,20 @@ class TargetLocalizerNode:
         ratio = float(valid.sum()) / denom
         return valid, ratio, int(valid.sum())
 
+    def _camera_model(self) -> CameraModel:
+        if self.camera_info is not None:
+            return CameraModel(
+                width=int(self.camera_info.width),
+                height=int(self.camera_info.height),
+                fx=float(self.camera_info.K[0]),
+                fy=float(self.camera_info.K[4]),
+                cx=float(self.camera_info.K[2]),
+                cy=float(self.camera_info.K[5]),
+            )
+        return self.camera_model_fallback
+
     def _mask_to_camera_point(
-        self, valid_mask: np.ndarray, depth_m: np.ndarray, camera_info: CameraInfo
+        self, valid_mask: np.ndarray, depth_m: np.ndarray, camera_model: CameraModel
     ) -> Optional[np.ndarray]:
         ys, xs = np.nonzero(valid_mask)
         if xs.size == 0:
@@ -303,10 +338,10 @@ class TargetLocalizerNode:
             ys = ys[keep]
             zs = zs[keep]
 
-        fx = float(camera_info.K[0])
-        fy = float(camera_info.K[4])
-        cx = float(camera_info.K[2])
-        cy = float(camera_info.K[5])
+        fx = float(camera_model.fx)
+        fy = float(camera_model.fy)
+        cx = float(camera_model.cx)
+        cy = float(camera_model.cy)
         if fx <= 1e-6 or fy <= 1e-6:
             return None
 
@@ -316,6 +351,20 @@ class TargetLocalizerNode:
         y3 = (ys_f - cy) * zs / fy
         points = np.stack([x3, y3, zs], axis=1)
         return np.median(points, axis=0)
+
+    def _body_point_is_plausible(self, point_body: np.ndarray) -> bool:
+        if point_body.shape[0] < 3:
+            return False
+        if not np.all(np.isfinite(point_body)):
+            return False
+        if point_body[0] <= 0.0:
+            return False
+        horizontal = math.hypot(float(point_body[0]), float(point_body[1]))
+        if horizontal > self.max_body_range_m:
+            return False
+        if abs(float(point_body[2])) > self.max_body_height_abs_m:
+            return False
+        return True
 
     def _estimate_confidence(
         self, *, infer_score: float, depth_valid_ratio: float, support_pixels: int, sync_err: float
@@ -382,6 +431,19 @@ class TargetLocalizerNode:
             return int(v) if v is not None else None
         except Exception:
             return None
+
+    @staticmethod
+    def _vector_param(name: str, default: List[float], expected_len: int) -> np.ndarray:
+        raw = rospy.get_param(name, default)
+        if isinstance(raw, str):
+            try:
+                raw = ast.literal_eval(raw)
+            except Exception as exc:
+                raise ValueError(f"failed to parse vector param {name}: {raw}") from exc
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if arr.size != expected_len:
+            raise ValueError(f"param {name} expects {expected_len} values, got {arr.size}")
+        return arr
 
 
 if __name__ == "__main__":

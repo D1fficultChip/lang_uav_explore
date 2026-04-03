@@ -81,6 +81,27 @@ class DockerRoslaunchAdapter(Adapter):
 
         self.mode, self.target, self.port, self.identity = _parse_target(container)
 
+    def _stage_cmd(self, stage: Dict[str, Any]) -> List[str]:
+        cmd = list(self.cmd)
+        overrides = stage.get("launch_overrides") or {}
+        if not overrides:
+            return cmd
+
+        roslaunch_args = [
+            f"{str(k)}:={v}"
+            for k, v in overrides.items()
+            if v is not None
+        ]
+        if not roslaunch_args:
+            return cmd
+
+        if len(cmd) >= 3 and cmd[0] == "bash" and cmd[1] == "-lc":
+            suffix = " ".join(shlex.quote(arg) for arg in roslaunch_args)
+            cmd[2] = f"{cmd[2]} {suffix}"
+            return cmd
+
+        return cmd + roslaunch_args
+
     # ---------- backends ----------
     def _docker(self, args: List[str], detach: bool = False) -> None:
         base = ["docker", "exec"]
@@ -130,12 +151,13 @@ class DockerRoslaunchAdapter(Adapter):
     # ---------- Adapter interface ----------
     def enter(self, stage: Dict[str, Any]) -> None:
         # Start roslaunch in background with nohup, write pidfile
-        cmd_str = " ".join(shlex.quote(x) for x in self.cmd)
+        stage_cmd = self._stage_cmd(stage)
+        cmd_str = " ".join(shlex.quote(x) for x in stage_cmd)
         bash = (
             f"nohup {cmd_str} > {shlex.quote(self.logfile)} 2>&1 & "
             f"echo $! > {shlex.quote(self.pidfile)}"
         )
-        self._run(["zsh", "-lc", bash], detach=True)
+        self._run(["bash", "-lc", bash], detach=True)
         print(f"[Adapter][{stage.get('intent','?')}][{self.mode}] started in {self.container}: {cmd_str}")
 
     def tick(self, stage: Dict[str, Any]) -> None:
@@ -153,5 +175,5 @@ class DockerRoslaunchAdapter(Adapter):
             f"fi; "
             f"pkill -f {shlex.quote(self.pattern)} 2>/dev/null || true"
         )
-        self._run(["zsh", "-lc", bash], detach=False)
+        self._run(["bash", "-lc", bash], detach=False)
         print(f"[Adapter][{stage.get('intent','?')}][{self.mode}] stopped in {self.container}")

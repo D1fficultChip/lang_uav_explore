@@ -1,0 +1,17 @@
+<launch>
+  <arg name="gui" default="false"/>
+  <arg name="paused" default="false"/>
+
+  <env name="GAZEBO_MODEL_PATH"
+       value="$(find perception_bridge)/models/gazebo_small_city_scene:$(optenv GAZEBO_MODEL_PATH)"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find perception_bridge)/worlds/small_city.world"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+    <arg name="verbose" value="true"/>
+  </include>
+</launch>

@@ -1,0 +1,46 @@
+map_config:
+  # Direct-Gazebo mode: FALCON builds the voxel map online from Gazebo depth.
+  # map_file is intentionally unused in this mode, but kept for schema compatibility.
+  map_file: "unused_in_direct_gazebo_mode.pcd"
+  map_dimension: 2
+
+  init_x: -47.0
+  init_y: 0.0
+  init_z: 2.0
+  init_yaw: 0.0
+
+  map_size:
+    map_min_x: -70.0
+    map_min_y: -60.0
+    map_min_z: -2.5
+    map_max_x: 125.0
+    map_max_y: 60.0
+    map_max_z: 12.0
+
+    box_min_x: -62.0
+    box_min_y: -50.0
+    box_min_z: 0.0
+    box_max_x: 115.0
+    box_max_y: 50.0
+    box_max_z: 8.0
+
+    vbox_min_x: -66.0
+    vbox_min_y: -55.0
+    vbox_min_z: -0.5
+    vbox_max_x: 120.0
+    vbox_max_y: 55.0
+    vbox_max_z: 10.0
+
+  scale: 1.0
+
+  T_b_c:
+  - [ 1.0, 0.0, 0.0, 0.10]
+  - [ 0.0, 1.0, 0.0, 0.00]
+  - [ 0.0, 0.0, 1.0, 0.05]
+  - [ 0.0, 0.0, 0.0, 1.00]
+
+  T_m_w:
+  - [ 1.0, 0.0, 0.0, 0.0]
+  - [ 0.0, 1.0, 0.0, 0.0]
+  - [ 0.0, 0.0, 1.0, 0.0]
+  - [ 0.0, 0.0, 0.0, 1.0]

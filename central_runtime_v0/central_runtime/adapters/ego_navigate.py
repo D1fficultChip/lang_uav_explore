@@ -147,19 +147,17 @@ class EgoNavigateAdapter:
     def enter(self, ctx: Dict[str, Any]) -> None:
         # 1) start EGO roslaunch
         cmd_str = " ".join(shlex.quote(x) for x in self.launch_cmd)
-        
-        # 使用 zsh 启动，确保 source 正确
-        # 注意：这里假设远程也是 zsh 环境，且 setup 文件兼容 zsh (通常 ROS 的 setup.bash 兼容 zsh，或者有 setup.zsh)
-        # 为了稳妥，仍然 source setup.bash，zsh 通常能处理它。如果你确定有 setup.zsh 也可以改。
-        bash = (
-            "source /opt/ros/noetic/setup.zsh && "
-            "source /home/nv/uav_demo/src/ego_ws/devel/setup.zsh && "
-            f"nohup {cmd_str} > {shlex.quote(self.logfile)} 2>&1 & "
-            f"echo $! > {shlex.quote(self.pidfile)}"
-        )
-        
-        # 按照参考代码，使用 zsh -lc 来执行
-        self._run(["zsh", "-lc", bash], detach=True)
+
+        if self.mode == "docker":
+            self._run(self.launch_cmd, detach=True)
+        else:
+            bash = (
+                "source /opt/ros/noetic/setup.bash && "
+                "source /home/nv/uav_demo/src/ego_ws/devel/setup.bash && "
+                f"nohup {cmd_str} > {shlex.quote(self.logfile)} 2>&1 & "
+                f"echo $! > {shlex.quote(self.pidfile)}"
+            )
+            self._run(["bash", "-lc", bash], detach=True)
         print(f"[Adapter][NAVIGATE][ego][{self.mode}] started in {self.target}: {cmd_str}")
 
         # 2) publish goal once (configurable)
@@ -169,12 +167,11 @@ class EgoNavigateAdapter:
             msg = _fmt_pose_stamped_yaml(self.goal_frame, x, y, z)
 
             pub_cmd = (
-                "source /opt/ros/noetic/setup.zsh && "
-                "source /home/nv/uav_demo/src/ego_ws/devel/setup.zsh && "
+                "source /opt/ros/noetic/setup.bash && "
                 f"rostopic pub -1 {shlex.quote(self.goal_topic)} geometry_msgs/PoseStamped \"{msg}\""
             )
             # 发送 goal 不需要 detach，等它发完就行
-            self._run(["zsh", "-lc", pub_cmd], detach=False)
+            self._run(["bash", "-lc", pub_cmd], detach=False)
             print(f"[Adapter][NAVIGATE][ego] goal published to {self.goal_topic}: [{x:.2f}, {y:.2f}, {z:.2f}]")
     
     def exit(self, ctx: Dict[str, Any]) -> None:
@@ -190,7 +187,7 @@ class EgoNavigateAdapter:
             f"fi; "
             f"pkill -f {shlex.quote(self.pattern)} 2>/dev/null || true"
         )
-        self._run(["zsh", "-lc", bash], detach=False)
+        self._run(["bash", "-lc", bash], detach=False)
         print(f"[Adapter][NAVIGATE][ego][{self.mode}] stopped in {self.target}")
 
     def _resolve_goal_xyz(self, ctx: Dict[str, Any]):

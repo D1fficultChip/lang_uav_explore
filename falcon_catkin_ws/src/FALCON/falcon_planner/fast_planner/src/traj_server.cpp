@@ -36,6 +36,8 @@ bool receive_traj_ = false;
 bool new_traj_ = false;
 bool task_finished_ = false;
 
+constexpr double kMaxTrajSwitchPosError = 0.08;
+
 // Executed traj, commanded and real ones
 vector<Eigen::Vector3d> traj_cmd_, vel_cmd_;
 
@@ -285,11 +287,35 @@ void bsplineCallback(const trajectory::BsplineConstPtr &msg) {
   }
   NonUniformBspline pos_traj(pos_pts, msg->order, 0.1);
   pos_traj.setKnot(knots);
+  double pos_traj_duration = pos_traj.getTimeSum();
 
   Eigen::MatrixXd yaw_pts(msg->yaw_pts.size(), 1);
   for (int i = 0; i < msg->yaw_pts.size(); ++i)
     yaw_pts(i, 0) = msg->yaw_pts[i];
   NonUniformBspline yaw_traj(yaw_pts, 3, msg->yaw_dt);
+
+  if (receive_traj_) {
+    ros::Time time_now = ros::Time::now();
+    double old_t = (time_now - start_time_).toSec();
+    old_t = std::max(0.0, std::min(old_t, traj_duration_));
+
+    double new_t = (time_now - msg->start_time).toSec();
+    new_t = std::max(0.0, std::min(new_t, pos_traj_duration));
+
+    Eigen::Vector3d old_pos = traj_[0].evaluateDeBoorT(old_t);
+    Eigen::Vector3d new_pos = pos_traj.evaluateDeBoorT(new_t);
+    double pos_err = (new_pos - old_pos).norm();
+
+    if (pos_err > kMaxTrajSwitchPosError) {
+      ROS_ERROR("[TrajServer] Reject new trajectory %d due to discontinuity. "
+                "Old traj t=%.3f pos=(%.2f, %.2f, %.2f), new traj t=%.3f pos=(%.2f, %.2f, %.2f), "
+                "error=%.3f > %.3f",
+                msg->traj_id, old_t, old_pos[0], old_pos[1], old_pos[2], new_t, new_pos[0],
+                new_pos[1], new_pos[2], pos_err, kMaxTrajSwitchPosError);
+      return;
+    }
+  }
+
   start_time_ = msg->start_time;
   traj_id_ = msg->traj_id;
 
@@ -300,7 +326,7 @@ void bsplineCallback(const trajectory::BsplineConstPtr &msg) {
   traj_.push_back(yaw_traj);
   traj_.push_back(yaw_traj.getDerivative());
   traj_.push_back(traj_[2].getDerivative());
-  traj_duration_ = traj_[0].getTimeSum();
+  traj_duration_ = pos_traj_duration;
 
   receive_traj_ = true;
 

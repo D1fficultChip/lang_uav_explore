@@ -215,11 +215,19 @@ UniformGrid::UniformGrid(ros::NodeHandle &nh, const Config &config,
 }
 
 int UniformGrid::positionToGridCellId(const Position &pos) {
+  if ((pos.array() < config_.bbox_min_.array()).any() ||
+      (pos.array() > config_.bbox_max_.array()).any()) {
+    return -1;
+  }
   int x = std::floor((pos.x() - config_.bbox_min_.x()) / config_.cell_size_.x());
   int y = std::floor((pos.y() - config_.bbox_min_.y()) / config_.cell_size_.y());
   int z = std::floor((pos.z() - config_.bbox_min_.z()) / config_.cell_size_.z());
 
-  return x + y * config_.num_cells_x_ + z * config_.num_cells_x_ * config_.num_cells_y_;
+  int id = x + y * config_.num_cells_x_ + z * config_.num_cells_x_ * config_.num_cells_y_;
+  if (id < 0 || id >= config_.num_cells_) {
+    return -1;
+  }
+  return id;
 }
 
 void UniformGrid::positionToGridCellId(const Position &pos, int &id) {
@@ -231,6 +239,15 @@ void UniformGrid::positionToGridCellCenterId(const Position &pos, int &cell_id, 
   center_id = -1;
 
   cell_id = positionToGridCellId(pos);
+  if (cell_id < 0 || cell_id >= static_cast<int>(uniform_grid_.size())) {
+    if (config_.verbose_) {
+      ROS_WARN("[UniformGrid] positionToGridCellCenterId: pos (%f, %f, %f) out of bbox or invalid cell id %d",
+               pos.x(), pos.y(), pos.z(), cell_id);
+    }
+    cell_id = -1;
+    center_id = -1;
+    return;
+  }
 
   Position bbox_min = uniform_grid_[cell_id].bbox_min_;
   Position bbox_max = uniform_grid_[cell_id].bbox_max_;

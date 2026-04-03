@@ -18,7 +18,7 @@ class CueBiasNode:
         self.req_json = rospy.get_param("~perception_request_json", "/shared/perception_request.json")
 
         # ---- Topics ----
-        self.odom_topic = rospy.get_param("~odom_topic", "/ekf/ekf_odom")
+        self.odom_topic = rospy.get_param("~odom_topic", "/uav_simulator/odometry")
         self.pub_topic = rospy.get_param("~pub_topic", "/lang/cue_hist")
         self.ctrl_topic = rospy.get_param("~ctrl_topic", "/lang/semantic_ctrl")
 

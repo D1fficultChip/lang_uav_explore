@@ -65,7 +65,7 @@
 
 ### 来自 skill policy / 配置
 
-- `observe_radius_m = 0.5`
+- `observe_radius_m = 2.5`
 - `hover_duration_s = 2.0`
 - `observe_timeout_s`
 - `goal_reached_tol_m`

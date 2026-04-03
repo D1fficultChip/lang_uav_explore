@@ -1,0 +1,92 @@
+<launch>
+  <arg name="gui" default="false"/>
+  <arg name="paused" default="false"/>
+
+  <arg name="map_name" default="small_house"/>
+  <arg name="model_name" default="gz_uav"/>
+  <arg name="command_topic" default="/planning/pos_cmd"/>
+  <arg name="mux_name" default="cmd_mux"/>
+  <arg name="hold_topic" default="/hold/pos_cmd"/>
+
+  <arg name="init_x" default="0.0"/>
+  <arg name="init_y" default="0.0"/>
+  <arg name="init_z" default="1.0"/>
+  <arg name="init_yaw" default="0.0"/>
+
+  <arg name="odom_topic" default="/uav_simulator/odometry"/>
+  <arg name="sensor_pose_topic" default="/uav_simulator/sensor_pose"/>
+  <arg name="camera_odom_topic" default="/uav_simulator/camera_odom"/>
+
+  <arg name="rgb_topic" default="/uav_simulator/rgb_camera/image_raw"/>
+  <arg name="camera_info_topic" default="/uav_simulator/rgb_camera/camera_info"/>
+  <arg name="depth_topic" default="/uav_simulator/depth_camera/depth/image_raw"/>
+  <arg name="depth_camera_info_topic" default="/uav_simulator/depth_camera/depth/camera_info"/>
+
+  <rosparam command="load" file="$(find exploration_manager)/config/map/$(arg map_name).yaml"/>
+  <param name="/map_config/init_x" value="$(arg init_x)"/>
+  <param name="/map_config/init_y" value="$(arg init_y)"/>
+  <param name="/map_config/init_z" value="$(arg init_z)"/>
+  <param name="/map_config/init_yaw" value="$(arg init_yaw)"/>
+
+  <include file="$(find aws_robomaker_small_house_world)/launch/small_house.launch">
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <node pkg="gazebo_ros" type="spawn_model" name="spawn_small_house_uav" output="screen"
+        args="-sdf -file $(find perception_bridge)/models/falcon_cam_depth_uav/model.sdf -model $(arg model_name) -x $(arg init_x) -y $(arg init_y) -z $(arg init_z) -Y $(arg init_yaw)"/>
+
+  <!-- Runtime-selectable command mux: FALCON / EGO / HOLD -> /planning/pos_cmd -->
+  <node pkg="topic_tools" type="mux" name="$(arg mux_name)" output="screen"
+        args="$(arg command_topic) /falcon/pos_cmd /ego/pos_cmd $(arg hold_topic)"/>
+
+  <node pkg="perception_bridge" type="hold_publisher.py" name="small_house_hold_publisher" output="screen">
+    <param name="odom_topic" value="/uav_simulator/odometry_norm"/>
+    <param name="out_topic" value="$(arg hold_topic)"/>
+    <param name="mux_selected_topic" value="/$(arg mux_name)/selected"/>
+    <param name="frame_id" value="world"/>
+    <param name="freeze_on_select" value="true"/>
+  </node>
+
+  <!-- Convert the currently selected position command stream into simulated odometry. -->
+  <node pkg="poscmd_2_odom" type="poscmd_2_odom" name="sim_poscmd_to_odom" output="screen">
+    <remap from="~command" to="$(arg command_topic)"/>
+    <remap from="~odometry" to="$(arg odom_topic)"/>
+    <param name="max_speed" value="0.8"/>
+    <param name="max_yaw_rate" value="0.3490658504"/>
+  </node>
+
+  <!-- Move the Gazebo model to follow the simulated odometry so the onboard cameras render correctly. -->
+  <node pkg="perception_bridge" type="pose_follower.py" name="small_house_pose_follower" output="screen">
+    <param name="model_name" value="$(arg model_name)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="pub_topic" value="/gazebo/set_model_state"/>
+  </node>
+
+  <!-- Publish normalized body odom and camera odom using a full body->camera transform. -->
+  <node pkg="perception_bridge" type="camera_odom_from_odom.py" name="small_house_camera_odom" output="screen">
+    <param name="input_odom" value="$(arg odom_topic)"/>
+    <param name="output_body_odom" value="/uav_simulator/odometry_norm"/>
+    <param name="output_cam_odom" value="$(arg camera_odom_topic)"/>
+    <param name="world_frame" value="world"/>
+    <param name="body_child_frame" value="base_link"/>
+    <param name="cam_child_frame" value="camera_depth_optical_frame"/>
+    <rosparam param="cam_xyz">[0.10, 0.0, 0.05]</rosparam>
+    <rosparam param="cam_rpy">[0.0, 0.0, 0.0]</rosparam>
+    <rosparam param="cam_extra_rpy">[-1.57079632679, 0.0, -1.57079632679]</rosparam>
+    <param name="copy_twist" value="false"/>
+  </node>
+
+  <!-- Keep a simple transform topic for tooling that still expects /uav_simulator/sensor_pose. -->
+  <node pkg="perception_bridge" type="sensor_pose_from_odom.py" name="small_house_sensor_pose" output="screen">
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="out_topic" value="$(arg sensor_pose_topic)"/>
+    <param name="world_frame" value="world"/>
+    <param name="sensor_frame" value="camera_depth_optical_frame"/>
+    <param name="offset_x" value="0.10"/>
+    <param name="offset_y" value="0.0"/>
+    <param name="offset_z" value="0.05"/>
+    <param name="offset_roll" value="-1.57079632679"/>
+    <param name="offset_pitch" value="0.0"/>
+    <param name="offset_yaw" value="-1.57079632679"/>
+  </node>
+</launch>

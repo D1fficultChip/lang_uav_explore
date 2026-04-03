@@ -1,0 +1,29 @@
+<launch>
+  <arg name="shared_dir" default="/shared"/>
+
+  <arg name="rgb_topic" default="/uav_simulator/rgb_camera/image_raw"/>
+  <arg name="depth_topic" default="/uav_simulator/depth_camera/depth/image_raw"/>
+  <arg name="camera_info_topic" default="/uav_simulator/depth_camera/depth/camera_info"/>
+  <arg name="odom_topic" default="/uav_simulator/odometry_norm"/>
+
+  <node pkg="perception_bridge" type="frame_dumper.py" name="hospital_frame_dumper" output="screen">
+    <param name="image_topic" value="$(arg rgb_topic)"/>
+    <param name="out_dir" value="$(arg shared_dir)"/>
+    <param name="rate_hz" value="5.0"/>
+  </node>
+
+  <node pkg="perception_bridge" type="target_localizer_node.py" name="hospital_target_localizer" output="screen">
+    <param name="shared_dir" value="$(arg shared_dir)"/>
+    <param name="depth_topic" value="$(arg depth_topic)"/>
+    <param name="camera_info_topic" value="$(arg camera_info_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="camera_to_body_translation" value="[0.10, 0.0, 0.05]"/>
+    <param name="camera_to_body_quaternion" value="[0.5, -0.5, 0.5, -0.5]"/>
+    <param name="depth_cache_size" value="120"/>
+    <param name="odom_cache_size" value="3000"/>
+    <param name="max_body_range_m" value="12.0"/>
+    <param name="max_body_height_abs_m" value="2.5"/>
+    <param name="target_frame" value="world"/>
+    <param name="body_frame" value="base_link"/>
+  </node>
+</launch>

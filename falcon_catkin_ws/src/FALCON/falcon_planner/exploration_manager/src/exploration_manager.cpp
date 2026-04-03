@@ -600,20 +600,34 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
 
     double sop_time = (ros::Time::now() - t1).toSec();
     ROS_INFO("[ExplorationManager] SOP time: %.2f ms", sop_time * 1000.0);
-    CHECK_LE(sop_time, 1.0) << "SOP solver internal error detected, solver blocked with unknown "
-                               "error. Please restart the planner";
+    bool sop_fallback = false;
+    if (sop_time > 1.0) {
+      ROS_WARN("[ExplorationManager] SOP solver is slow (%.3f s > 1.0 s). "
+               "Fallback to grid_tour2/frontier default order instead of aborting.",
+               sop_time);
+      LOG(WARNING) << "[ExplorationManager] SOP slow fallback, sop_time=" << sop_time;
+      sop_fallback = true;
+    }
+    if (sop_path.empty()) {
+      ROS_WARN("[ExplorationManager] SOP solver returned empty path. "
+               "Fallback to grid_tour2/frontier default order.");
+      LOG(WARNING) << "[ExplorationManager] SOP empty-path fallback";
+      sop_fallback = true;
+    }
     ee_->sop_times_.push_back(make_pair(sop_cost_matrix_time, sop_time));
 
     // Draw SOP path
     vector<Vector3d> grid_tour_tmp;
-    for (int i : sop_path) {
-      if (i < ed_->grid_tour2_.size() - 1) {
-        if (i == 0)
-          grid_tour_tmp.push_back(ed_->grid_tour2_[i]);
-        else
-          grid_tour_tmp.push_back(ed_->grid_tour2_[i + 1]); // next pos is removed
-      } else {
-        grid_tour_tmp.push_back(ed_->points_[frontier_ids[i - (ed_->grid_tour2_.size() - 1)]]);
+    if (!sop_fallback) {
+      for (int i : sop_path) {
+        if (i < ed_->grid_tour2_.size() - 1) {
+          if (i == 0)
+            grid_tour_tmp.push_back(ed_->grid_tour2_[i]);
+          else
+            grid_tour_tmp.push_back(ed_->grid_tour2_[i + 1]); // next pos is removed
+        } else {
+          grid_tour_tmp.push_back(ed_->points_[frontier_ids[i - (ed_->grid_tour2_.size() - 1)]]);
+        }
       }
     }
     for (auto &pt : grid_tour_tmp) {
@@ -624,15 +638,23 @@ int ExplorationManager::planExploreMotionHGrid(const Vector3d &pos, const Vector
 
     // Extract frontier ids from sop_path
     vector<int> frontier_ids_from_sop_path;
-    for (int i : sop_path) {
-      if (i == 0)
-        continue;
-      if (i >= ed_->grid_tour2_.size() - 1)
-        frontier_ids_from_sop_path.push_back(frontier_ids[i - (ed_->grid_tour2_.size() - 1)]);
-      else {
-        next_cell_id = hierarchical_grid_->getLayerCellId(0, ed_->grid_tour2_[i + 1]);
-        next_grid_pos = ed_->grid_tour2_[i + 1];
-        break;
+    if (sop_fallback) {
+      frontier_ids_from_sop_path = frontier_ids;
+      if (ed_->grid_tour2_.size() > 1) {
+        next_cell_id = next_cell_id_grid_tour2;
+        next_grid_pos = ed_->grid_tour2_[1];
+      }
+    } else {
+      for (int i : sop_path) {
+        if (i == 0)
+          continue;
+        if (i >= ed_->grid_tour2_.size() - 1)
+          frontier_ids_from_sop_path.push_back(frontier_ids[i - (ed_->grid_tour2_.size() - 1)]);
+        else {
+          next_cell_id = hierarchical_grid_->getLayerCellId(0, ed_->grid_tour2_[i + 1]);
+          next_grid_pos = ed_->grid_tour2_[i + 1];
+          break;
+        }
       }
     }
     // ===== Lang bias (MAIN): rerank SOP output before assigning to frontier_ids =====

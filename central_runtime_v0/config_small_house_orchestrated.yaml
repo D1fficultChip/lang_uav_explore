@@ -1,0 +1,189 @@
+# ============================================================
+# small-house orchestration config
+#
+# 顺序：
+#   1) 先起 GSAM2
+#   2) 再起 Gazebo + UAV 基础环境 + perception bridge
+#   3) 再起 runtime 容器
+#   4) 由 central runtime 启动 / 停止 FALCON 和 EGO
+# ============================================================
+
+shared_dir: /shared
+
+infer_json: infer.json
+infer_cue_json: infer_cue.json
+target_localization_json: target_localization.json
+prompt_txt: prompt.txt
+
+tick_hz: 10.0
+log_jsonl_path: plan_runtime.jsonl
+event_jsonl_path: runtime_events.jsonl
+stage_settle_s: 0.5
+
+perception_request_json: perception_request.json
+emit_cues_txt: true
+cues_txt: cues.txt
+
+mux:
+  select_service: /mux/select
+  hold_topic: /hold/pos_cmd
+  selected_topic: /mux/selected
+  pre_switch_hover_s: 0.3
+  odom_topic: /uav_simulator/odometry_norm
+  odom_max_age_s: 0.3
+  odom_wait_timeout_s: 2.0
+  intent_source:
+    SEARCH: /falcon/pos_cmd
+    NAVIGATE: /ego/pos_cmd
+    OBSERVE: /ego/pos_cmd
+    TRACK: /ego/pos_cmd
+
+ego_goal_topic: /move_base_simple/goal
+entity_goals:
+  E_safe_exit:
+    frame: world
+    x: 4.5
+    y: 0.2
+    z: 1.2
+    yaw_deg: 0.0
+
+adapters:
+  SEARCH:
+    container: falcon_noetic
+    cmd:
+      - bash
+      - -lc
+      - source /opt/ros/noetic/setup.bash && source /root/catkin_ws/devel/setup.bash && roslaunch perception_bridge small_house_falcon_only.launch init_x:=4.5 init_y:=0.2 init_z:=2.0
+    pidfile: /shared/falcon_search.pid
+    logfile: /shared/falcon_search.log
+    stop_pattern: roslaunch perception_bridge small_house_falcon_only.launch
+
+  NAVIGATE:
+    container: ego_noetic
+    cmd:
+      - bash
+      - -lc
+      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom max_vel:=1.0 max_acc:=0.6
+    pidfile: /shared/ego_nav.pid
+    logfile: /shared/ego_nav.log
+    stop_pattern: roslaunch ego_planner
+    publish_goal_once: false
+    goal_topic: /move_base_simple/goal
+    startup_sleep_s: 0.5
+
+  OBSERVE:
+    container: ego_noetic
+    cmd:
+      - bash
+      - -lc
+      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom max_vel:=1.0 max_acc:=0.6
+    pidfile: /shared/ego_nav.pid
+    logfile: /shared/ego_nav.log
+    stop_pattern: roslaunch ego_planner
+    publish_goal_once: false
+    goal_topic: /move_base_simple/goal
+    startup_sleep_s: 0.5
+
+  TRACK:
+    container: ego_noetic
+    cmd:
+      - bash
+      - -lc
+      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom max_vel:=1.0 max_acc:=0.6
+    pidfile: /shared/ego_nav.pid
+    logfile: /shared/ego_nav.log
+    stop_pattern: roslaunch ego_planner
+    publish_goal_once: false
+    goal_topic: /move_base_simple/goal
+    startup_sleep_s: 0.5
+
+verified:
+  min_navigate_time_s: 2.0
+  require_found: true
+  min_score: 0.5
+  visible_min_score: 0.5
+
+intent_alias:
+  INSPECT: TRACK
+
+world_state:
+  obs_ttl_s: 1.0
+  cue_ttl_s: 2.0
+  max_recent_evidence: 20
+
+verification:
+  require_req_match: true
+  require_entity_match: true
+  require_primary_role: true
+  stable_hits_for_verify: 2
+  max_detection_age_s: 1.0
+  min_score: 0.5
+  min_mask_quality: 0.55
+  max_ambiguous_top2_gap: 0.08
+  min_motion_progress_m: 0.3
+  nav_stall_timeout_s: 5.0
+  nav_goal_reached_tol_m: 0.8
+  nav_progress_check_period_s: 1.0
+
+diagnostics:
+  max_events: 50
+
+recovery:
+  max_retries_per_stage: 2
+  hold_reobserve_s: 2.0
+  allow_fallback_to_search: true
+
+reasoner:
+  enabled: false
+  backend: noop
+  base_url: https://api.openai.com/v1/chat/completions
+  model: ""
+  api_key_env: OPENAI_API_KEY
+  timeout_s: 20.0
+  temperature: 0.1
+  min_stage_dwell_s: 2.0
+  cooldown_s: 3.0
+  verify_window_s: 2.0
+  max_recent_events: 20
+  trigger_on_inconclusive: true
+  auto_rewrite_request: true
+  allow_actions:
+    - continue
+    - retry_same_stage
+    - hold_and_reobserve
+    - switch_cue_priority
+    - insert_verify_stage
+    - fallback_to_search
+    - safe_terminate
+  auto_apply_actions:
+    - retry_same_stage
+    - hold_and_reobserve
+    - switch_cue_priority
+    - fallback_to_search
+    - safe_terminate
+  allow_insert_verify_stage: false
+  allow_unknown_target_stage: false
+
+semantic_verifier:
+  enabled: true
+  backend: api
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  model: qwen-plus
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 20.0
+  temperature: 0.1
+  include_image: true
+  min_stage_dwell_s: 1.5
+  cooldown_s: 4.0
+  trigger_on_ambiguous: true
+  trigger_on_inconclusive: true
+  trigger_on_relations: true
+  trigger_on_failure: false
+  auto_apply_followup: true
+  allow_followups:
+    - continue
+    - hold_and_reobserve
+    - retry_same_stage
+    - insert_verify_stage
+    - switch_cue_priority
+    - fallback_to_search
