@@ -102,6 +102,7 @@ class PlanExecutor:
         verification_cfg: Optional[Dict[str, Any]] = None,
         reasoner_cfg: Optional[Dict[str, Any]] = None,
         semantic_cfg: Optional[Dict[str, Any]] = None,
+        escape_cfg: Optional[Dict[str, Any]] = None,
         stage_settle_s: float = 0.0,
         frame_path: Optional[str] = None,
         perception_request_path: Optional[str] = None,
@@ -136,6 +137,7 @@ class PlanExecutor:
         self.verification_cfg = verification_cfg or {}
         self.reasoner_cfg = reasoner_cfg or {}
         self.semantic_cfg = semantic_cfg or {}
+        self.escape_cfg = escape_cfg or {}
         self.cond = ConditionEngine(
             self.bb,
             verified_cfg=self.verified_cfg,
@@ -195,6 +197,33 @@ class PlanExecutor:
         }
         self.semantic_observe_success_conf_min = float(self.semantic_cfg.get("observe_success_confidence_min", 0.72))
         self.semantic_observe_failure_conf_min = float(self.semantic_cfg.get("observe_failure_confidence_min", 0.72))
+        self.escape_enabled = bool(self.escape_cfg.get("enabled", False))
+        self.escape_intents = {
+            str(x).strip().upper()
+            for x in self.escape_cfg.get("intents", ["SEARCH"])
+            if str(x).strip()
+        } or {"SEARCH"}
+        self.escape_backend = str(self.escape_cfg.get("backend", "falcon")).strip().lower()
+        self.escape_odom_buffer_horizon_s = float(self.escape_cfg.get("odom_buffer_horizon_s", 45.0))
+        self.escape_odom_sample_min_dist_m = float(self.escape_cfg.get("odom_sample_min_dist_m", 0.8))
+        self.escape_odom_sample_max_interval_s = float(self.escape_cfg.get("odom_sample_max_interval_s", 2.0))
+        self.escape_min_stage_dwell_s = float(self.escape_cfg.get("min_stage_dwell_s", 8.0))
+        self.escape_stuck_window_s = float(self.escape_cfg.get("stuck_window_s", 6.0))
+        self.escape_stuck_min_progress_m = float(self.escape_cfg.get("stuck_min_progress_m", 0.5))
+        self.escape_stuck_region_radius_m = float(self.escape_cfg.get("stuck_region_radius_m", 1.2))
+        self.escape_min_rollback_dist_m = float(self.escape_cfg.get("min_rollback_dist_m", 1.5))
+        self.escape_max_rollback_dist_m = float(self.escape_cfg.get("max_rollback_dist_m", 8.0))
+        self.escape_max_time_s = float(self.escape_cfg.get("max_escape_time_s", 12.0))
+        self.escape_max_retries = int(max(0, self.escape_cfg.get("max_escape_retries", 2)))
+        self.escape_max_per_stage = int(max(1, self.escape_cfg.get("max_escape_per_stage", 3)))
+        self.escape_goal_retry_interval_s = float(self.escape_cfg.get("goal_retry_interval_s", 1.0))
+        self.escape_progress_timeout_s = float(self.escape_cfg.get("progress_timeout_s", 4.0))
+        self.escape_success_radius_m = float(self.escape_cfg.get("success_radius_m", 0.8))
+        self.escape_failure_cooldown_s = float(self.escape_cfg.get("failure_cooldown_s", 10.0))
+        self.escape_mux_settle_s = float(self.escape_cfg.get("mux_settle_s", 0.3))
+        self.escape_success_clearance_m = float(
+            self.escape_cfg.get("success_min_anchor_clearance_m", max(self.escape_min_rollback_dist_m * 0.8, 1.0))
+        )
 
         self.stage_id = self._pick_start_stage()
         self.mission_start_t = time.time()
@@ -220,7 +249,13 @@ class PlanExecutor:
         self._last_localization: Optional[TargetLocalization] = None
         self._observe_state: Optional[Dict[str, Any]] = None
         self._track_state: Optional[Dict[str, Any]] = None
+        self._escape_state: Optional[Dict[str, Any]] = None
         self._semantic_hold_counts: Dict[str, int] = {}
+        self._escape_history: List[Dict[str, Any]] = []
+        self._search_motion_trace: List[Dict[str, Any]] = []
+        self._escape_node_counter = 0
+        self._stage_escape_counts: Dict[str, int] = {}
+        self._last_escape_failed_t: Dict[str, float] = {}
 
     def close(self):
         if self._log_fp:
@@ -619,6 +654,398 @@ class PlanExecutor:
             src = self.intent_source.get("NAVIGATE")
         if src:
             self._mux_select(src)
+
+    def _select_escape_source(self) -> None:
+        src = self.intent_source.get("NAVIGATE") or self.intent_source.get("OBSERVE") or self.intent_source.get("SEARCH")
+        if src:
+            self._mux_select(src)
+
+    # ---------------- SEARCH escape helpers ----------------
+    def _escape_enabled_for_stage(self, stage_id: str) -> bool:
+        if not self.escape_enabled:
+            return False
+        stage = self.plan.stages[stage_id]
+        return stage.intent.upper() in self.escape_intents
+
+    def _reset_search_escape_state(self) -> None:
+        self._escape_state = None
+        self._escape_history = []
+        self._search_motion_trace = []
+        self._nav_goal_state = None
+
+    def _append_search_motion_pose(self, now: float, pose: Tuple[float, float, float, float]) -> None:
+        self._search_motion_trace.append(
+            {
+                "t_wall": float(now),
+                "position_xyz": [float(pose[0]), float(pose[1]), float(pose[2])],
+                "yaw": float(pose[3]),
+            }
+        )
+        cutoff = float(now) - self.escape_odom_buffer_horizon_s
+        self._search_motion_trace = [p for p in self._search_motion_trace if float(p.get("t_wall", 0.0)) >= cutoff]
+
+    def _record_escape_history_node(self, now: float, pose: Tuple[float, float, float, float]) -> None:
+        if not self._escape_enabled_for_stage(self.stage_id):
+            return
+        xyz = [float(pose[0]), float(pose[1]), float(pose[2])]
+        if self._escape_history:
+            last = self._escape_history[-1]
+            last_xyz = last.get("position_xyz") or [0.0, 0.0, 0.0]
+            dist = _dist3((xyz[0], xyz[1], xyz[2]), (float(last_xyz[0]), float(last_xyz[1]), float(last_xyz[2])))
+            dt = float(now) - float(last.get("t_wall", 0.0))
+            if dist < self.escape_odom_sample_min_dist_m and dt < self.escape_odom_sample_max_interval_s:
+                return
+        self._escape_node_counter += 1
+        self._escape_history.append(
+            {
+                "node_id": f"esc_{self._escape_node_counter}",
+                "t_wall": float(now),
+                "position_xyz": xyz,
+                "yaw": float(pose[3]),
+                "success_count": 0,
+                "failure_count": 0,
+                "stage_id": self.stage_id,
+            }
+        )
+        cutoff = float(now) - self.escape_odom_buffer_horizon_s
+        self._escape_history = [n for n in self._escape_history if float(n.get("t_wall", 0.0)) >= cutoff]
+
+    def _update_search_escape_buffers(self, now: float) -> Optional[Tuple[float, float, float, float]]:
+        if not self._escape_enabled_for_stage(self.stage_id):
+            return None
+        pose = self._read_odom_pose_once()
+        if pose is None:
+            return None
+        self._append_search_motion_pose(now, pose)
+        self._record_escape_history_node(now, pose)
+        return pose
+
+    def _search_motion_summary(self, now: float) -> Dict[str, Any]:
+        trace = [p for p in self._search_motion_trace if (float(now) - float(p.get("t_wall", 0.0))) <= self.escape_stuck_window_s]
+        if len(trace) < 2:
+            return {"trace_len": len(trace), "window_s": 0.0, "progress_m": None, "bbox_diag_m": None}
+        first = trace[0]["position_xyz"]
+        last = trace[-1]["position_xyz"]
+        xs = [float(p["position_xyz"][0]) for p in trace]
+        ys = [float(p["position_xyz"][1]) for p in trace]
+        zs = [float(p["position_xyz"][2]) for p in trace]
+        progress_m = _dist3((float(first[0]), float(first[1]), float(first[2])), (float(last[0]), float(last[1]), float(last[2])))
+        bbox_diag_m = _dist3((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+        return {
+            "trace_len": len(trace),
+            "window_s": float(trace[-1]["t_wall"]) - float(trace[0]["t_wall"]),
+            "progress_m": progress_m,
+            "bbox_diag_m": bbox_diag_m,
+            "anchor_pose": list(last),
+        }
+
+    def _clear_search_stuck_diag_if_recovered(self, now: float) -> None:
+        st = self._get_stage_state()
+        if st is None or st.current_diag != DiagnosticCode.SEARCH_STUCK or self._escape_state:
+            return
+        summary = self._search_motion_summary(now)
+        progress = summary.get("progress_m")
+        if progress is None:
+            return
+        if progress >= self.escape_stuck_min_progress_m:
+            self.world_state.set_stage_diag(self.stage_id, None)
+
+    def _select_escape_goal(self, now: float, pose: Tuple[float, float, float, float]) -> Optional[Dict[str, Any]]:
+        if not self._escape_history:
+            return None
+        cur_xyz = (float(pose[0]), float(pose[1]), float(pose[2]))
+        anchor = cur_xyz
+        candidates: List[Dict[str, Any]] = []
+        reverse_cost = 0.0
+        last_xyz = cur_xyz
+        for node in reversed(self._escape_history):
+            xyz = node.get("position_xyz") or [0.0, 0.0, 0.0]
+            node_xyz = (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+            reverse_cost += _dist3(last_xyz, node_xyz)
+            last_xyz = node_xyz
+            euclid = _dist3(cur_xyz, node_xyz)
+            anchor_dist = _dist3(anchor, node_xyz)
+            if euclid < self.escape_min_rollback_dist_m:
+                continue
+            if reverse_cost > self.escape_max_rollback_dist_m:
+                break
+            if anchor_dist < self.escape_stuck_region_radius_m:
+                continue
+            success_count = int(node.get("success_count", 0))
+            failure_count = int(node.get("failure_count", 0))
+            score = (0.25 * anchor_dist) + (0.5 * success_count) - (1.5 * failure_count) - reverse_cost
+            candidates.append(
+                {
+                    "node_id": node.get("node_id"),
+                    "goal_pose": {
+                        "frame": "world",
+                        "x": node_xyz[0],
+                        "y": node_xyz[1],
+                        "z": node_xyz[2],
+                        "yaw_deg": math.degrees(float(node.get("yaw", 0.0))),
+                    },
+                    "rollback_cost_m": reverse_cost,
+                    "euclid_dist_m": euclid,
+                    "score": score,
+                    "success_count": success_count,
+                    "failure_count": failure_count,
+                }
+            )
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item["score"], -item["rollback_cost_m"]), reverse=True)
+        best = dict(candidates[0])
+        best["candidate_nodes"] = candidates[:5]
+        return best
+
+    def _search_escape_cooldown_active(self, now: float) -> bool:
+        last_failed = self._last_escape_failed_t.get(self.stage_id)
+        if last_failed is None:
+            return False
+        return (float(now) - float(last_failed)) < self.escape_failure_cooldown_s
+
+    def _maybe_trigger_search_escape(self, now: float) -> bool:
+        stage = self.plan.stages[self.stage_id]
+        if stage.intent != "SEARCH" or not self._escape_enabled_for_stage(self.stage_id):
+            return False
+        if self._escape_state is not None:
+            return True
+        if (now - self.stage_enter_t) < self.escape_min_stage_dwell_s:
+            return False
+        if self._search_escape_cooldown_active(now):
+            return False
+        if int(self._stage_escape_counts.get(self.stage_id, 0)) >= self.escape_max_per_stage:
+            return False
+        summary = self._search_motion_summary(now)
+        progress = summary.get("progress_m")
+        bbox_diag = summary.get("bbox_diag_m")
+        if progress is None or bbox_diag is None:
+            return False
+        if progress >= self.escape_stuck_min_progress_m:
+            self._clear_search_stuck_diag_if_recovered(now)
+            return False
+        if bbox_diag > max(self.escape_stuck_region_radius_m * 2.0, self.escape_stuck_min_progress_m * 2.0):
+            return False
+        self._emit_diag(
+            code=DiagnosticCode.SEARCH_STUCK,
+            message="search stage appears stuck in a small local region",
+            now=now,
+            details={"progress_m": progress, "bbox_diag_m": bbox_diag},
+        )
+        action = self.recovery.suggest(
+            stage_id=self.stage_id,
+            stage_intent=stage.intent,
+            diagnostic_code=DiagnosticCode.SEARCH_STUCK,
+            retry_count=self._stage_retry_counts.get(self.stage_id, 0),
+        )
+        return self._apply_recovery_action(now, action)
+
+    def _start_escape(self, now: float, *, reason: str, diag_code: Optional[str]) -> bool:
+        if self._escape_state is not None or not self._escape_enabled_for_stage(self.stage_id):
+            return False
+        pose = self._read_odom_pose_once()
+        if pose is None:
+            return False
+        goal_info = self._select_escape_goal(now, pose)
+        if goal_info is None:
+            return False
+        self._stage_escape_counts[self.stage_id] = int(self._stage_escape_counts.get(self.stage_id, 0)) + 1
+        stage_state = self._get_stage_state()
+        if stage_state is not None:
+            stage_state.escape_count = int(self._stage_escape_counts[self.stage_id])
+            stage_state.last_escape_t = float(now)
+            stage_state.last_escape_status = "running"
+            stage_state.last_escape_goal = [
+                round(float(goal_info["goal_pose"]["x"]), 3),
+                round(float(goal_info["goal_pose"]["y"]), 3),
+                round(float(goal_info["goal_pose"]["z"]), 3),
+            ]
+        self._select_escape_source()
+        if self.escape_mux_settle_s > 1e-3:
+            time.sleep(min(self.escape_mux_settle_s, 1.0))
+        ok = self._publish_navigation_goal(self.active_entity_id, goal_info["goal_pose"], now, trigger=True)
+        self._escape_state = {
+            "active": True,
+            "phase": "escaping" if ok else "pending_goal",
+            "trigger_reason": reason,
+            "trigger_diag": diag_code,
+            "started_t": float(now),
+            "goal_node_id": goal_info["node_id"],
+            "goal_pose": dict(goal_info["goal_pose"]),
+            "goal_publish_ok": bool(ok),
+            "goal_published_t": float(now),
+            "goal_publish_timeout_t": float(now) + self.escape_goal_retry_interval_s,
+            "retry_count": 0,
+            "last_progress_t": float(now),
+            "last_event_t": float(now),
+            "initial_distance": None,
+            "last_distance": None,
+            "rollback_cost_m": float(goal_info["rollback_cost_m"]),
+            "stuck_anchor_pose": [float(pose[0]), float(pose[1]), float(pose[2])],
+            "resume_stage_id": self.stage_id,
+            "planner_backend": self.escape_backend,
+            "candidate_nodes": goal_info.get("candidate_nodes", []),
+        }
+        self._record_milestone(
+            "escape_started",
+            now,
+            {
+                "goal_node_id": goal_info["node_id"],
+                "goal": goal_info["goal_pose"],
+                "rollback_cost_m": goal_info["rollback_cost_m"],
+                "ok": ok,
+            },
+        )
+        self._emit_runtime_event(
+            "escape_started",
+            now=now,
+            details={
+                "goal_node_id": goal_info["node_id"],
+                "goal": goal_info["goal_pose"],
+                "rollback_cost_m": goal_info["rollback_cost_m"],
+                "ok": ok,
+            },
+        )
+        self._emit_runtime_event(
+            "escape_goal_selected",
+            now=now,
+            details={"goal_node_id": goal_info["node_id"], "candidates": goal_info.get("candidate_nodes", [])},
+        )
+        return True
+
+    def _mark_escape_goal_result(self, *, success: bool) -> None:
+        if self._escape_state is None:
+            return
+        goal_node_id = self._escape_state.get("goal_node_id")
+        if not goal_node_id:
+            return
+        for node in self._escape_history:
+            if node.get("node_id") == goal_node_id:
+                key = "success_count" if success else "failure_count"
+                node[key] = int(node.get(key, 0)) + 1
+                return
+
+    def _finish_escape(self, now: float, *, success: bool, reason: str) -> None:
+        if self._escape_state is None:
+            return
+        goal_pose = self._escape_state.get("goal_pose")
+        self._mark_escape_goal_result(success=success)
+        stage_state = self._get_stage_state()
+        if stage_state is not None:
+            stage_state.last_escape_status = "success" if success else "failed"
+        event_type = "escape_succeeded" if success else "escape_failed"
+        self._record_milestone(event_type, now, {"reason": reason, "goal": goal_pose})
+        self._emit_runtime_event(event_type, now=now, details={"reason": reason, "goal": goal_pose})
+        self._emit_runtime_event(
+            "recovery_finished",
+            now=now,
+            details={"kind": "escape", "status": "success" if success else "failed", "reason": reason},
+        )
+        self._select_intent_source("SEARCH")
+        self._nav_goal_state = None
+        if success:
+            self.world_state.set_stage_diag(self.stage_id, None)
+        else:
+            self._last_escape_failed_t[self.stage_id] = float(now)
+            self._emit_diag(code=DiagnosticCode.ESCAPE_FAILED, message=f"escape failed: {reason}", now=now, details={"goal": goal_pose})
+        self._escape_state = None
+        self._current_recovery = None
+
+    def _retry_escape_goal(self, now: float, *, reason: str) -> bool:
+        if self._escape_state is None:
+            return False
+        if int(self._escape_state.get("retry_count", 0)) >= self.escape_max_retries:
+            return False
+        goal = self._escape_state.get("goal_pose")
+        if not isinstance(goal, dict):
+            return False
+        retries = int(self._escape_state.get("retry_count", 0)) + 1
+        self._escape_state["retry_count"] = retries
+        self._escape_state["goal_published_t"] = float(now)
+        self._escape_state["goal_publish_timeout_t"] = float(now) + self.escape_goal_retry_interval_s
+        self._select_escape_source()
+        if self.escape_mux_settle_s > 1e-3:
+            time.sleep(min(self.escape_mux_settle_s, 1.0))
+        ok = self._publish_navigation_goal(self.active_entity_id, goal, now, trigger=True)
+        self._escape_state["goal_publish_ok"] = bool(ok)
+        self._escape_state["phase"] = "escaping" if ok else "pending_goal"
+        self._emit_runtime_event(
+            "escape_goal_retry",
+            now=now,
+            details={"goal": goal, "reason": reason, "retry_count": retries, "ok": ok},
+        )
+        return bool(ok)
+
+    def _tick_escape(self, now: float) -> Optional[str]:
+        if self._escape_state is None:
+            return None
+        pose = self._read_odom_pose_once()
+        if pose is None:
+            if (now - float(self._escape_state.get("started_t", now))) >= self.escape_max_time_s:
+                self._finish_escape(now, success=False, reason="escape_odom_unavailable")
+                return "finished"
+            return "active"
+        goal = self._escape_state.get("goal_pose") or {}
+        goal_xyz = (
+            float(goal.get("x", 0.0)),
+            float(goal.get("y", 0.0)),
+            float(goal.get("z", 0.0)),
+        )
+        pos = (float(pose[0]), float(pose[1]), float(pose[2]))
+        dist = _dist3(pos, goal_xyz)
+        if self._escape_state.get("initial_distance") is None:
+            self._escape_state["initial_distance"] = dist
+            self._escape_state["last_distance"] = dist
+        else:
+            last_distance = float(self._escape_state.get("last_distance", dist))
+            if (last_distance - dist) >= max(self.min_motion_progress_m * 0.5, 0.15):
+                self._escape_state["last_progress_t"] = float(now)
+            self._escape_state["last_distance"] = dist
+        anchor = self._escape_state.get("stuck_anchor_pose") or [pos[0], pos[1], pos[2]]
+        anchor_dist = _dist3(pos, (float(anchor[0]), float(anchor[1]), float(anchor[2])))
+        if (now - float(self._escape_state.get("last_event_t", 0.0))) >= 1.0:
+            self._emit_runtime_event(
+                "escape_progress",
+                now=now,
+                details={"distance_to_goal_m": dist, "anchor_clearance_m": anchor_dist, "retry_count": self._escape_state.get("retry_count", 0)},
+            )
+            self._escape_state["last_event_t"] = float(now)
+        if dist <= self.escape_success_radius_m or anchor_dist >= self.escape_success_clearance_m:
+            self._finish_escape(now, success=True, reason="goal_reached")
+            return "finished"
+        if self._escape_state.get("phase") == "pending_goal" and now >= float(self._escape_state.get("goal_publish_timeout_t", now)):
+            if not self._retry_escape_goal(now, reason="initial_publish_pending"):
+                self._finish_escape(now, success=False, reason="escape_goal_publish_timeout")
+                if self._stage_retry_counts.get(self.stage_id, 0) < self.recovery.max_retries_per_stage:
+                    self._stage_retry_counts[self.stage_id] = int(self._stage_retry_counts.get(self.stage_id, 0)) + 1
+                    self._retry_current_stage()
+                    return "stage_restarted"
+                self._request_stop(f"escape failed at {self.stage_id}")
+                return "finished"
+            return "active"
+        if (now - float(self._escape_state.get("started_t", now))) >= self.escape_max_time_s:
+            if self._retry_escape_goal(now, reason="escape_timeout"):
+                self._escape_state["last_progress_t"] = float(now)
+                return "active"
+            self._finish_escape(now, success=False, reason="escape_timeout")
+            if self._stage_retry_counts.get(self.stage_id, 0) < self.recovery.max_retries_per_stage:
+                self._stage_retry_counts[self.stage_id] = int(self._stage_retry_counts.get(self.stage_id, 0)) + 1
+                self._retry_current_stage()
+                return "stage_restarted"
+            self._request_stop(f"escape timeout at {self.stage_id}")
+            return "finished"
+        if (now - float(self._escape_state.get("last_progress_t", now))) >= self.escape_progress_timeout_s:
+            if self._retry_escape_goal(now, reason="escape_progress_timeout"):
+                self._escape_state["last_progress_t"] = float(now)
+                return "active"
+            self._finish_escape(now, success=False, reason="escape_progress_timeout")
+            if self._stage_retry_counts.get(self.stage_id, 0) < self.recovery.max_retries_per_stage:
+                self._stage_retry_counts[self.stage_id] = int(self._stage_retry_counts.get(self.stage_id, 0)) + 1
+                self._retry_current_stage()
+                return "stage_restarted"
+            self._request_stop(f"escape progress timeout at {self.stage_id}")
+            return "finished"
+        return "active"
 
     # ---------------- NAVIGATE helpers ----------------
     def _resolve_goal_for_entity(self, eid: str) -> Optional[Dict[str, Any]]:
@@ -1591,18 +2018,9 @@ class PlanExecutor:
             "failure_met": failure_met,
         }
 
-    def _maybe_recover(self, now: float, criteria: Dict[str, Any]) -> None:
-        if not criteria.get("failure_met"):
-            self._current_recovery = None
-            return
-        retry_count = self._stage_retry_counts.get(self.stage_id, 0)
+    def _apply_recovery_action(self, now: float, action: Optional[RecoveryAction]) -> bool:
+        retry_count = int(self._stage_retry_counts.get(self.stage_id, 0))
         diag = self.diagnostics.latest(self.stage_id)
-        action = self.recovery.suggest(
-            stage_id=self.stage_id,
-            stage_intent=self.plan.stages[self.stage_id].intent,
-            diagnostic_code=None if diag is None else diag.code,
-            retry_count=retry_count,
-        )
         self._current_recovery = action
         self._emit_runtime_event(
             "recovery_suggested",
@@ -1615,7 +2033,7 @@ class PlanExecutor:
 
         if action is None or action.kind == "safe_terminate":
             self._request_stop(f"stage failure at {self.stage_id}")
-            return
+            return True
 
         if action.kind == "retry_same_stage" and retry_count < self.recovery.max_retries_per_stage:
             self._stage_retry_counts[self.stage_id] = retry_count + 1
@@ -1624,7 +2042,7 @@ class PlanExecutor:
             self._retry_current_stage()
             self._record_milestone("recovery_finished", time.time(), {"action": action.kind})
             self._emit_runtime_event("recovery_finished", now=time.time(), details={"kind": action.kind})
-            return
+            return True
 
         if action.kind == "hold_and_reobserve":
             self._record_milestone("recovery_started", now, {"action": action.kind})
@@ -1634,7 +2052,7 @@ class PlanExecutor:
                 self._publish_hold_for(self.recovery.hold_reobserve_s)
             self._record_milestone("recovery_finished", time.time(), {"action": action.kind})
             self._emit_runtime_event("recovery_finished", now=time.time(), details={"kind": action.kind})
-            return
+            return True
 
         if action.kind == "fallback_to_search":
             search_stage = next((sid for sid, st in self.plan.stages.items() if st.intent == "SEARCH"), None)
@@ -1644,9 +2062,36 @@ class PlanExecutor:
                 self._transition_to(search_stage, Transition(fr=self.stage_id, to=search_stage, when={"type": "RECOVERY", "params": {"reason": action.reason}}))
                 self._record_milestone("recovery_finished", time.time(), {"action": action.kind})
                 self._emit_runtime_event("recovery_finished", now=time.time(), details={"kind": action.kind, "target_stage": search_stage})
-                return
+                return True
+
+        if action.kind == "escape":
+            self._record_milestone("recovery_started", now, {"action": action.kind, "target_stage": self.stage_id})
+            self._emit_runtime_event("recovery_started", now=now, details={"kind": action.kind, "target_stage": self.stage_id})
+            if self._start_escape(now, reason=action.reason, diag_code=None if diag is None else diag.code):
+                return True
+            self._record_milestone("recovery_finished", time.time(), {"action": action.kind, "status": "start_failed"})
+            self._emit_runtime_event("recovery_finished", now=time.time(), details={"kind": action.kind, "status": "start_failed"})
+            if retry_count < self.recovery.max_retries_per_stage:
+                self._stage_retry_counts[self.stage_id] = retry_count + 1
+                self._retry_current_stage()
+                return True
 
         self._request_stop(f"unhandled recovery at {self.stage_id}")
+        return True
+
+    def _maybe_recover(self, now: float, criteria: Dict[str, Any]) -> None:
+        if not criteria.get("failure_met"):
+            self._current_recovery = None
+            return
+        retry_count = self._stage_retry_counts.get(self.stage_id, 0)
+        diag = self.diagnostics.latest(self.stage_id)
+        action = self.recovery.suggest(
+            stage_id=self.stage_id,
+            stage_intent=self.plan.stages[self.stage_id].intent,
+            diagnostic_code=None if diag is None else diag.code,
+            retry_count=retry_count,
+        )
+        self._apply_recovery_action(now, action)
 
     # ---------------- semantic verification ----------------
     def _should_run_semantic_verifier(self, now: float, verifier_results: Dict[str, VerificationResult], criteria: Dict[str, Any]) -> bool:
@@ -2173,6 +2618,7 @@ class PlanExecutor:
 
     def _tick_once(self):
         now = time.time()
+        self.bb.set_reference_time(now)
         self.world_state.step(now)
         verify_window_active = self._update_verify_window(now)
 
@@ -2190,6 +2636,10 @@ class PlanExecutor:
             ad.tick(self._make_stage_ctx(self.stage_id))
             self.world_state.set_stage_skill_status(self.stage_id, "running")
 
+        if stage.intent == "SEARCH":
+            self._update_search_escape_buffers(now)
+            self._clear_search_stuck_diag_if_recovered(now)
+
         self._update_navigation_progress(now)
         verifier_results = self._evaluate_verifiers(now)
         criteria = self._evaluate_stage_criteria(now)
@@ -2201,6 +2651,24 @@ class PlanExecutor:
             transition_evals.append({"to": tr.to, "when": tr.when, "ok": ok, "error": err})
             if ok and fired is None:
                 fired = tr
+
+        escape_status: Optional[str] = None
+        if stage.intent == "SEARCH":
+            stage_enter_before_escape = self.stage_enter_t
+            escape_status = self._tick_escape(now)
+            if self.stage_enter_t != stage_enter_before_escape:
+                return
+            if escape_status is None and fired is None:
+                stage_enter_before_start = self.stage_enter_t
+                if self._maybe_trigger_search_escape(now):
+                    escape_status = "active"
+                if self.stage_enter_t != stage_enter_before_start:
+                    return
+            if escape_status:
+                for tr_eval in transition_evals:
+                    if tr_eval["ok"]:
+                        tr_eval["suppressed_by_escape"] = True
+                fired = None
 
         # SEARCH stages should hand off immediately once a transition condition is met.
         # Running the semantic verifier first can block for several seconds, which makes
@@ -2246,6 +2714,9 @@ class PlanExecutor:
         )
         self._log(snap)
 
+        if escape_status:
+            return
+
         if self._maybe_run_reasoner(now, verifier_results, criteria):
             return
 
@@ -2275,6 +2746,7 @@ class PlanExecutor:
         criteria: Dict[str, Any],
     ) -> Dict[str, Any]:
         ent = self.world_state.entities.get(self.active_entity_id)
+        motion_summary = self._search_motion_summary(now) if self.plan.stages[self.stage_id].intent == "SEARCH" else {}
         cue_summary = []
         stage = self.plan.stages[self.stage_id]
         for cue_id in stage.cue_targets:
@@ -2384,6 +2856,10 @@ class PlanExecutor:
             },
             "observe_state": None if self._observe_state is None else dict(self._observe_state),
             "track_state": None if self._track_state is None else dict(self._track_state),
+            "escape_state": None if self._escape_state is None else dict(self._escape_state),
+            "escape_history_size": len(self._escape_history),
+            "search_motion_progress_m": motion_summary.get("progress_m"),
+            "search_motion_bbox_diag_m": motion_summary.get("bbox_diag_m"),
             "cue_summary": cue_summary,
             "criteria": criteria,
             "verifiers": {
@@ -2528,6 +3004,8 @@ class PlanExecutor:
         self.stage_enter_t = time.time()
         self.bb.reset_entity(self.active_entity_id)
         self._semantic_hold_counts[self.stage_id] = 0
+        self._current_recovery = None
+        self._nav_goal_state = None
         self._enter_stage(self.stage_id)
 
     def _transition_to(self, next_stage_id: str, fired: Transition):
@@ -2625,6 +3103,13 @@ class PlanExecutor:
 
         print(f"[StageEnter] {stage_id} intent={st.intent} entity={eid} prompt={prompt!r} req_id={self.current_req_id}")
 
+        if st.intent == "SEARCH":
+            self._reset_search_escape_state()
+            start_pose = self._read_odom_pose_once()
+            if start_pose is not None:
+                self._append_search_motion_pose(now, start_pose)
+                self._record_escape_history_node(now, start_pose)
+
         ad = self.adapters.get(st.intent)
         if ad:
             ad.enter(stage_ctx)
@@ -2690,4 +3175,6 @@ class PlanExecutor:
             self._observe_state = None
         if st.intent == "TRACK":
             self._track_state = None
+        if st.intent == "SEARCH":
+            self._reset_search_escape_state()
         print(f"[StageExit] {stage_id}")

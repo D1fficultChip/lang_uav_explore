@@ -78,6 +78,7 @@ def build_status(runtime_log: Path, event_log: Path, shared_dir: Path) -> Dict[s
     verify_window = snap.get("verify_window") or {}
     criteria = snap.get("criteria") or {}
     diagnostics = snap.get("diagnostics") or []
+    escape_state = snap.get("escape_state") or {}
 
     latest_event = events[-1] if events else {}
     recent_event_briefs = []
@@ -153,6 +154,15 @@ def build_status(runtime_log: Path, event_log: Path, shared_dir: Path) -> Dict[s
             "reason": track_state.get("reason"),
             "last_goal": track_state.get("last_goal"),
         },
+        "escape": {
+            "active": bool(escape_state.get("active", False)),
+            "phase": escape_state.get("phase"),
+            "reason": escape_state.get("trigger_reason"),
+            "goal_pose": escape_state.get("goal_pose"),
+            "retry_count": escape_state.get("retry_count"),
+            "history_size": snap.get("escape_history_size"),
+            "recent_progress_m": snap.get("search_motion_progress_m"),
+        },
         "criteria": {
             "success_met": bool(criteria.get("success_met", False)),
             "failure_met": bool(criteria.get("failure_met", False)),
@@ -180,6 +190,7 @@ def print_terminal(status: Dict[str, Any]) -> None:
     ver = status["verification"]
     sem = status.get("semantic", {})
     crit = status["criteria"]
+    esc = status.get("escape", {})
     print("=" * 72)
     print(
         f"Stage={rt.get('stage')}  Intent={rt.get('intent')}  Skill={rt.get('current_skill_id')}  "
@@ -196,6 +207,11 @@ def print_terminal(status: Dict[str, Any]) -> None:
     print(
         f"Observe phase={obs.get('phase')} reason={obs.get('reason')}  "
         f"Criteria success={crit.get('success_met')} failure={crit.get('failure_met')}"
+    )
+    print(
+        f"Escape active={esc.get('active')} phase={esc.get('phase')} "
+        f"reason={esc.get('reason')} retries={esc.get('retry_count')} "
+        f"progress={esc.get('recent_progress_m')}"
     )
     print(
         f"Semantic status={sem.get('status')} conf={sem.get('confidence')} "

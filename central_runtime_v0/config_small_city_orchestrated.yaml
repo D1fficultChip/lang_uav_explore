@@ -133,6 +133,29 @@ recovery:
   hold_reobserve_s: 2.0
   allow_fallback_to_search: true
 
+escape:
+  enabled: true
+  intents: [SEARCH]
+  backend: falcon
+  odom_buffer_horizon_s: 45.0
+  odom_sample_min_dist_m: 0.8
+  odom_sample_max_interval_s: 2.0
+  min_stage_dwell_s: 8.0
+  stuck_window_s: 20.0
+  stuck_min_progress_m: 0.5
+  stuck_region_radius_m: 1.2
+  min_rollback_dist_m: 1.5
+  max_rollback_dist_m: 8.0
+  max_escape_time_s: 12.0
+  max_escape_retries: 2
+  max_escape_per_stage: 3
+  goal_retry_interval_s: 1.0
+  progress_timeout_s: 4.0
+  success_radius_m: 0.8
+  success_min_anchor_clearance_m: 1.6
+  failure_cooldown_s: 10.0
+  mux_settle_s: 0.3
+
 reasoner:
   enabled: false
   backend: noop

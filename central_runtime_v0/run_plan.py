@@ -150,6 +150,7 @@ def main():
         allow_unknown_target_stage=bool(reasoner_cfg.get("allow_unknown_target_stage", False)),
     )
     semantic_cfg = cfg.get("semantic_verifier", {}) or {}
+    escape_cfg = cfg.get("escape", {}) or {}
     semantic_backend = str(semantic_cfg.get("backend", "noop")).strip().lower()
     if bool(semantic_cfg.get("enabled", False)) and semantic_backend == "api":
         semantic_verifier = APISemanticVerifier(
@@ -283,6 +284,7 @@ def main():
         verification_cfg=verification_cfg,
         reasoner_cfg=reasoner_cfg,
         semantic_cfg=semantic_cfg,
+        escape_cfg=escape_cfg,
         stage_settle_s=stage_settle_s,
         frame_path=frame_path,
 

@@ -19,6 +19,10 @@ class Blackboard:
         self.latest: Dict[str, Detection] = {}
         # key: (entity_id, min_score)
         self.hit_state: Dict[Tuple[str, float], HitState] = {}
+        self.reference_now: Optional[float] = None
+
+    def set_reference_time(self, now: Optional[float]) -> None:
+        self.reference_now = None if now is None else float(now)
 
     def update_detection(self, entity_id: str, det: Detection) -> None:
         self.latest[entity_id] = det
@@ -52,7 +56,7 @@ class Blackboard:
         """
         st = self._get_state(entity_id, min_score)
         det = self.latest.get(entity_id)
-        now = time.time()
+        now = self.reference_now if self.reference_now is not None else time.time()
 
         if det is None:
             st.streak = 0
@@ -100,7 +104,7 @@ class Blackboard:
         """
         st = self._get_state(entity_id, min_score)
         det = self.latest.get(entity_id)
-        now = time.time()
+        now = self.reference_now if self.reference_now is not None else time.time()
 
         if det is None:
             st.miss_streak = 0

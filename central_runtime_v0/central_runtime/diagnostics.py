@@ -15,7 +15,9 @@ class DiagnosticCode:
     SEMANTIC_NEEDS_VIEW = "semantic_needs_view"
     NAV_NO_GOAL = "nav_no_goal"
     NAV_STALLED = "nav_stalled"
+    SEARCH_STUCK = "search_stuck"
     TRACK_TARGET_LOST = "track_target_lost"
+    ESCAPE_FAILED = "escape_failed"
     STAGE_FAILURE = "stage_failure"
 
 

@@ -72,6 +72,10 @@ class StageRuntimeState:
     last_semantic_followup: Optional[str] = None
     verify_window_until: Optional[float] = None
     verify_window_reason: Optional[str] = None
+    escape_count: int = 0
+    last_escape_t: Optional[float] = None
+    last_escape_status: Optional[str] = None
+    last_escape_goal: Optional[List[float]] = None
 
 
 class WorldState:
