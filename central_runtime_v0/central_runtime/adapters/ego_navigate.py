@@ -2,44 +2,8 @@ from __future__ import annotations
 import shlex
 import subprocess
 import time
-import re
 from typing import Any, Dict, Optional, List
-
-# -----------------------------------------------------------------------------
-# Helper: Parse target string (复用自 DockerRoslaunchAdapter)
-# -----------------------------------------------------------------------------
-def _parse_target(container: str):
-    s = (container or "").strip()
-
-    if s.startswith("sshpass:"):
-        s = s[len("sshpass:"):]
-        mode = "sshpass"
-    elif s.startswith("ssh://"):
-        s = s[len("ssh://"):]
-        mode = "ssh"
-    elif s.startswith("ssh:"):
-        s = s[len("ssh:"):]
-        mode = "ssh"
-    else:
-        return ("docker", s, None, None)
-
-    identity = None
-    # allow query style ?i=/path
-    if "?" in s:
-        s, q = s.split("?", 1)
-        m = re.search(r"(?:^|&)i=([^&]+)", q)
-        if m:
-            identity = m.group(1)
-
-    port = None
-    # parse host:port if exists (but not IPv6)
-    m = re.match(r"^(?P<who>[^:]+):(?P<port>\d+)$", s)
-    if m:
-        s = m.group("who")
-        port = int(m.group("port"))
-
-    target = s
-    return (mode, target, port, identity)
+from .transport import parse_endpoint, wrap_shell_command
 
 def _fmt_pose_stamped_yaml(frame_id: str, x: float, y: float, z: float, yaw: Optional[float] = None) -> str:
     """
@@ -76,6 +40,7 @@ class EgoNavigateAdapter:
         publish_goal_once: bool = True,
         startup_sleep_s: float = 0.5,
         ssh_extra_args: Optional[List[str]] = None,
+        shell_prelude: Optional[str] = None,
     ):
         self.container = container
         self.launch_cmd = launch_cmd
@@ -91,9 +56,14 @@ class EgoNavigateAdapter:
         self.publish_goal_once = publish_goal_once
         self.startup_sleep_s = float(startup_sleep_s)
         self.ssh_extra_args = ssh_extra_args or []
+        self.shell_prelude = shell_prelude
 
         # Parse target immediately
-        self.mode, self.target, self.port, self.identity = _parse_target(container)
+        endpoint = parse_endpoint(container)
+        self.mode = endpoint.mode
+        self.target = endpoint.target
+        self.port = endpoint.port
+        self.identity = endpoint.identity
 
     # -------------------------------------------------------------------------
     # Backends (完全参考 DockerRoslaunchAdapter)
@@ -104,12 +74,17 @@ class EgoNavigateAdapter:
             base.append("-d")
         base.append(self.target)  # container name
         base.extend(args)
-        subprocess.run(base, check=False)
+        try:
+            subprocess.run(base, check=False, timeout=15.0)
+        except subprocess.TimeoutExpired:
+            print(f"[Adapter][SSH][WARN] command timed out in {self.target}: {' '.join(args)}")
 
-    def _ssh(self, args: List[str]) -> None:
+    def _ssh(self, args: List[str], detach: bool = False) -> None:
         # ssh key 模式：BatchMode=yes（不允许交互）
         # sshpass 模式：不能 BatchMode=yes，否则不会提示密码，sshpass也没机会喂密码
-        base = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
+        base = ["ssh", "-n", "-o", "StrictHostKeyChecking=accept-new"]
+        if detach:
+            base.append("-f")
 
         if self.mode == "ssh":
             base += ["-o", "BatchMode=yes"]
@@ -133,12 +108,15 @@ class EgoNavigateAdapter:
 
         subprocess.run(base, check=False)
 
+    def _run_shell(self, shell_cmd: str, detach: bool = False) -> None:
+        wrapped = wrap_shell_command(shell_cmd, self.shell_prelude)
+        self._run(["bash", "-lc", wrapped], detach=detach)
+
     def _run(self, args: List[str], detach: bool = False) -> None:
         if self.mode == "docker":
             self._docker(args, detach=detach)
         else:
-            # ssh: detach handled by nohup in bash wrapper; no need ssh -f
-            self._ssh(args)
+            self._ssh(args, detach=detach)
 
     # -------------------------------------------------------------------------
     # Adapter Lifecycle
@@ -147,17 +125,11 @@ class EgoNavigateAdapter:
     def enter(self, ctx: Dict[str, Any]) -> None:
         # 1) start EGO roslaunch
         cmd_str = " ".join(shlex.quote(x) for x in self.launch_cmd)
-
-        if self.mode == "docker":
-            self._run(self.launch_cmd, detach=True)
-        else:
-            bash = (
-                "source /opt/ros/noetic/setup.bash && "
-                "source /home/nv/uav_demo/src/ego_ws/devel/setup.bash && "
-                f"nohup {cmd_str} > {shlex.quote(self.logfile)} 2>&1 & "
-                f"echo $! > {shlex.quote(self.pidfile)}"
-            )
-            self._run(["bash", "-lc", bash], detach=True)
+        shell_cmd = (
+            f"nohup {cmd_str} < /dev/null > {shlex.quote(self.logfile)} 2>&1 & "
+            f"echo $! > {shlex.quote(self.pidfile)}"
+        )
+        self._run_shell(shell_cmd, detach=True)
         print(f"[Adapter][NAVIGATE][ego][{self.mode}] started in {self.target}: {cmd_str}")
 
         # 2) publish goal once (configurable)
@@ -166,18 +138,15 @@ class EgoNavigateAdapter:
             x, y, z = self._resolve_goal_xyz(ctx)
             msg = _fmt_pose_stamped_yaml(self.goal_frame, x, y, z)
 
-            pub_cmd = (
-                "source /opt/ros/noetic/setup.bash && "
-                f"rostopic pub -1 {shlex.quote(self.goal_topic)} geometry_msgs/PoseStamped \"{msg}\""
-            )
+            pub_cmd = f"rostopic pub -1 {shlex.quote(self.goal_topic)} geometry_msgs/PoseStamped \"{msg}\""
             # 发送 goal 不需要 detach，等它发完就行
-            self._run(["bash", "-lc", pub_cmd], detach=False)
+            self._run_shell(pub_cmd, detach=False)
             print(f"[Adapter][NAVIGATE][ego] goal published to {self.goal_topic}: [{x:.2f}, {y:.2f}, {z:.2f}]")
     
     def exit(self, ctx: Dict[str, Any]) -> None:
         # Stop by pidfile if present; fallback to pkill -f pattern
         # 这里的 Shell 脚本逻辑和 DockerRoslaunchAdapter 保持完全一致
-        bash = (
+        shell_cmd = (
             f"if [ -f {shlex.quote(self.pidfile)} ]; then "
             f"  PID=$(cat {shlex.quote(self.pidfile)}); "
             f"  kill -INT $PID 2>/dev/null || true; "
@@ -187,7 +156,7 @@ class EgoNavigateAdapter:
             f"fi; "
             f"pkill -f {shlex.quote(self.pattern)} 2>/dev/null || true"
         )
-        self._run(["bash", "-lc", bash], detach=False)
+        self._run_shell(shell_cmd, detach=False)
         print(f"[Adapter][NAVIGATE][ego][{self.mode}] stopped in {self.target}")
 
     def _resolve_goal_xyz(self, ctx: Dict[str, Any]):

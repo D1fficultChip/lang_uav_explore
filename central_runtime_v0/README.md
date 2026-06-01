@@ -17,6 +17,24 @@ You need *some* process to keep updating:
 2) Run:
    python3 run_plan.py --plan /path/to/plan.json --config config.yaml
 
+## Adapter Transport Modes
+- Simulation keeps using the existing orchestrated configs such as [config_small_house_orchestrated.yaml](/home/young/uav_demo/central_runtime_v0/config_small_house_orchestrated.yaml), where adapters target Docker containers like `falcon_noetic` and `ego_noetic`.
+- Real-robot mode can now use structured SSH adapter fields in [config_real_uav_ssh.yaml](/home/young/uav_demo/central_runtime_v0/config_real_uav_ssh.yaml):
+  - `transport: ssh | sshpass | docker`
+  - `target: nv@192.168.x.x` or container name
+  - optional `port`, `identity`, `ssh_extra_args`
+  - optional `shell_prelude` for `source .../setup.bash` style environment setup
+- The legacy `container: ssh:nv@...` form still works, so old configs remain compatible.
+
+## Real-Robot SSH Runtime
+Use [run_runtime_real_ssh.sh](/home/young/uav_demo/tools/system_test/run_runtime_real_ssh.sh) to launch the runtime from the host while dispatching SEARCH / NAVIGATE / OBSERVE / TRACK through SSH:
+
+```bash
+bash /home/young/uav_demo/tools/system_test/run_runtime_real_ssh.sh
+```
+
+Override `PLAN_PATH` or `RUNTIME_CONFIG` if you want a different task or robot host profile.
+
 ## Notes
 - v0 attributes infer.json to the *current stage's primary target* (one target per stage).
 - VERIFIED semantics in v0: (stage time >= min_navigate_time_s) AND (entity detected at least once).

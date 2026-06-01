@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from .fs_utils import open_append_resilient
+
 
 @dataclass
 class RuntimeEvent:
@@ -23,7 +25,7 @@ class RuntimeEventLogger:
         self._fp = None
         if path:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._fp = open(path, "a", encoding="utf-8")
+            self._fp = open_append_resilient(path, encoding="utf-8")
 
     def emit(
         self,

@@ -4,7 +4,9 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
+import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,11 +26,13 @@ from .reasoner.guard import GuardDecision, ReasonerGuard
 from .reasoner.noop import NoopRuntimeReasoner
 from .reasoner.state_summarizer import StateSummarizer
 from .runtime_events import RuntimeEventLogger
+from .fs_utils import open_append_resilient
 from .semantic_verifier import BaseSemanticVerifier, NoopSemanticVerifier, SemanticVerifyRequest, SemanticVerifyResponse
 from .skills.registry import SkillRegistry
 from .verification import VerificationResult, VerificationStatus
 from .verifiers.base import BaseVerifier
 from .world_state import StageRuntimeState, WorldState
+from .adapters.transport import ShellTransport
 
 
 def _norm_prompt(s: str) -> str:
@@ -64,6 +68,153 @@ def _quat_from_yaw(yaw: float) -> Tuple[float, float, float, float]:
 
 def _dist3(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+class OdomPoseCache:
+    """
+    Maintain a long-lived `rostopic echo` subscription and keep the latest odom pose
+    in memory, so runtime control logic does not need to SSH and subscribe per query.
+    """
+
+    def __init__(
+        self,
+        transport: ShellTransport,
+        odom_topic: str,
+        *,
+        restart_interval_s: float = 1.0,
+    ):
+        self.transport = transport
+        self.odom_topic = str(odom_topic)
+        self.restart_interval_s = max(0.2, float(restart_interval_s))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._latest_pose: Optional[Tuple[float, float, float, float]] = None
+        self._latest_wall_t: Optional[float] = None
+        self._last_error: Optional[str] = None
+        self._warned_stale = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="odom-pose-cache", daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def get_pose(self, *, max_age_s: float) -> Optional[Tuple[float, float, float, float]]:
+        with self._lock:
+            pose = self._latest_pose
+            wall_t = self._latest_wall_t
+        if pose is None or wall_t is None:
+            return None
+        if (time.time() - wall_t) > max(0.0, float(max_age_s)):
+            if not self._warned_stale:
+                age = time.time() - wall_t
+                print(f"[ODOM][WARN] cached odom stale: age={age:.2f}s topic={self.odom_topic}")
+                self._warned_stale = True
+            return None
+        self._warned_stale = False
+        return pose
+
+    def last_error(self) -> Optional[str]:
+        with self._lock:
+            return self._last_error
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            block: List[str] = []
+            try:
+                proc = self.transport.popen_shell(
+                    f"rostopic echo {shlex.quote(self.odom_topic)}",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                self._proc = proc
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    line = raw.rstrip("\n")
+                    if line.strip() == "---":
+                        self._consume_block(block)
+                        block = []
+                    else:
+                        block.append(line)
+                if block:
+                    self._consume_block(block)
+                if self._stop.is_set():
+                    break
+                rc = proc.poll()
+                self._set_error(f"odom stream exited rc={rc}")
+            except Exception as e:
+                self._set_error(str(e))
+            finally:
+                proc = self._proc
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                self._proc = None
+            if not self._stop.is_set():
+                time.sleep(self.restart_interval_s)
+
+    def _set_error(self, message: str) -> None:
+        with self._lock:
+            self._last_error = message
+
+    def _consume_block(self, block: List[str]) -> None:
+        text = "\n".join(block)
+        pose = _parse_odom_pose_from_text(text)
+        if pose is None:
+            return
+        with self._lock:
+            self._latest_pose = pose
+            self._latest_wall_t = time.time()
+            self._last_error = None
+
+
+def _parse_odom_pose_from_text(out: str) -> Optional[Tuple[float, float, float, float]]:
+    mpos = re.search(
+        r"position:\s*\n\s*x:\s*([-+0-9.eE]+)\s*\n\s*y:\s*([-+0-9.eE]+)\s*\n\s*z:\s*([-+0-9.eE]+)",
+        out,
+    )
+    if not mpos:
+        return None
+    px = float(mpos.group(1))
+    py = float(mpos.group(2))
+    pz = float(mpos.group(3))
+
+    mori = re.search(
+        r"orientation:\s*\n\s*x:\s*([-+0-9.eE]+)\s*\n\s*y:\s*([-+0-9.eE]+)\s*\n\s*z:\s*([-+0-9.eE]+)\s*\n\s*w:\s*([-+0-9.eE]+)",
+        out,
+    )
+    if not mori:
+        yaw = 0.0
+    else:
+        yaw = _yaw_from_quat(float(mori.group(1)), float(mori.group(2)), float(mori.group(3)), float(mori.group(4)))
+    return (px, py, pz, yaw)
 
 
 class PlanExecutor:
@@ -111,6 +262,7 @@ class PlanExecutor:
         entity_goals: Optional[Dict[str, Any]] = None,
         ego_goal_topic: str = "/move_base_simple/goal",
         mux_cfg: Optional[Dict[str, Any]] = None,
+        ros_transport_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.plan = plan
         self.infer_reader = infer_reader
@@ -154,14 +306,21 @@ class PlanExecutor:
 
         self.entity_goals = entity_goals or {}
         self.ego_goal_topic = ego_goal_topic
+        self.ros_transport = ShellTransport.from_config(ros_transport_cfg)
 
         mux_cfg = mux_cfg or {}
+        self.control_dry_run = bool(mux_cfg.get("control_dry_run", False))
+        self.read_odom_in_dry_run = bool(mux_cfg.get("read_odom_in_dry_run", False))
         self.mux_select_service = mux_cfg.get("select_service", "/mux/select")
         self.mux_selected_topic = mux_cfg.get("selected_topic", "/mux/selected")
         self.hold_topic = mux_cfg.get("hold_topic", "/hold/pos_cmd")
         self.pre_switch_hover_s = float(mux_cfg.get("pre_switch_hover_s", 0.3))
         self.odom_topic = mux_cfg.get("odom_topic", "/uav_simulator/odometry")
         self.odom_wait_timeout_s = float(mux_cfg.get("odom_wait_timeout_s", 2.0))
+        self.odom_cache_enabled = bool(mux_cfg.get("odom_cache_enabled", False))
+        self.odom_cache_max_age_s = float(mux_cfg.get("odom_cache_max_age_s", 0.6))
+        self.odom_cache_restart_interval_s = float(mux_cfg.get("odom_cache_restart_interval_s", 1.0))
+        self.odom_cache_allow_oneshot_fallback = bool(mux_cfg.get("odom_cache_allow_oneshot_fallback", True))
         self.intent_source = mux_cfg.get("intent_source", {}) or {}
 
         self.nav_progress_check_period_s = float(self.verification_cfg.get("nav_progress_check_period_s", 1.0))
@@ -181,6 +340,7 @@ class PlanExecutor:
         self.semantic_trigger_on_inconclusive = bool(self.semantic_cfg.get("trigger_on_inconclusive", True))
         self.semantic_trigger_on_relations = bool(self.semantic_cfg.get("trigger_on_relations", True))
         self.semantic_trigger_on_failure = bool(self.semantic_cfg.get("trigger_on_failure", False))
+        self.semantic_trigger_always = bool(self.semantic_cfg.get("trigger_always", False))
         self.semantic_auto_apply_followup = bool(self.semantic_cfg.get("auto_apply_followup", True))
         self.semantic_allow_followups = set(self.semantic_cfg.get("allow_followups", []))
         self.semantic_observe_gate_enabled = bool(self.semantic_cfg.get("observe_gate_enabled", False))
@@ -234,7 +394,7 @@ class PlanExecutor:
         self.current_req_id: Optional[int] = None
         self.expected_primary_prompt = ""
 
-        self._log_fp = open(log_jsonl_path, "a", encoding="utf-8") if log_jsonl_path else None
+        self._log_fp = open_append_resilient(log_jsonl_path, encoding="utf-8") if log_jsonl_path else None
         self._stop_requested = False
         self._terminal_reason: Optional[str] = None
         self._verification_results: Dict[str, VerificationResult] = {}
@@ -246,6 +406,14 @@ class PlanExecutor:
         self._last_reasoner_response: Optional[ReasonerResponse] = None
         self._last_guard_decision: Optional[GuardDecision] = None
         self._last_semantic_response: Optional[SemanticVerifyResponse] = None
+        self._last_semantic_metrics: Dict[str, Any] = {
+            "query_type": None,
+            "latency_s": None,
+            "started_t": None,
+            "finished_t": None,
+            "call_count": 0,
+            "avg_latency_s": None,
+        }
         self._last_localization: Optional[TargetLocalization] = None
         self._observe_state: Optional[Dict[str, Any]] = None
         self._track_state: Optional[Dict[str, Any]] = None
@@ -256,8 +424,18 @@ class PlanExecutor:
         self._escape_node_counter = 0
         self._stage_escape_counts: Dict[str, int] = {}
         self._last_escape_failed_t: Dict[str, float] = {}
+        self._odom_pose_cache: Optional[OdomPoseCache] = None
+        if self.odom_cache_enabled and not (self.control_dry_run and not self.read_odom_in_dry_run):
+            self._odom_pose_cache = OdomPoseCache(
+                self.ros_transport,
+                self.odom_topic,
+                restart_interval_s=self.odom_cache_restart_interval_s,
+            )
+            self._odom_pose_cache.start()
 
     def close(self):
+        if self._odom_pose_cache is not None:
+            self._odom_pose_cache.close()
         if self._log_fp:
             self._log_fp.close()
         self.event_logger.close()
@@ -570,15 +748,17 @@ class PlanExecutor:
     # ---------------- mux / hover helpers ----------------
     def _mux_select(self, topic: str) -> bool:
         topic = str(topic)
+        if self.control_dry_run:
+            print(f"[MUX][DRY-RUN] skip select {self.mux_select_service} -> {topic}")
+            return True
         try:
-            p = subprocess.run(
-                ["rosservice", "call", self.mux_select_service, topic],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            p = self.ros_transport.run_shell(
+                f"rosservice call {shlex.quote(self.mux_select_service)} {shlex.quote(topic)}",
+                timeout=8.0,
+                capture_output=True,
             )
             if p.returncode != 0:
-                print(f"[MUX][WARN] select failed: {p.stderr.strip()}")
+                print(f"[MUX][WARN] select failed: {(p.stderr or '').strip()}")
                 return False
             return True
         except FileNotFoundError:
@@ -589,38 +769,39 @@ class PlanExecutor:
             return False
 
     def _read_odom_pose_once(self) -> Optional[Tuple[float, float, float, float]]:
+        if self.control_dry_run and not self.read_odom_in_dry_run:
+            return None
+        if self._odom_pose_cache is not None:
+            pose = self._odom_pose_cache.get_pose(max_age_s=self.odom_cache_max_age_s)
+            if pose is not None:
+                return pose
+            cache_error = self._odom_pose_cache.last_error()
+            if cache_error:
+                print(f"[ODOM][WARN] cached odom stream unavailable: {cache_error}")
+            if not self.odom_cache_allow_oneshot_fallback:
+                return None
         try:
-            out = subprocess.check_output(
-                ["rostopic", "echo", "-n", "1", self.odom_topic],
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=2.0,
+            proc = self.ros_transport.run_shell(
+                f"rostopic echo -n 1 {shlex.quote(self.odom_topic)}",
+                timeout=max(0.5, float(self.odom_wait_timeout_s)),
+                capture_output=True,
             )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode != 0:
+                raise RuntimeError(out.strip() or f"rostopic exited with {proc.returncode}")
         except Exception as e:
             print(f"[HOLD][WARN] cannot read odom: {e}")
             return None
 
-        mpos = re.search(
-            r"position:\s*\n\s*x:\s*([-+0-9.eE]+)\s*\n\s*y:\s*([-+0-9.eE]+)\s*\n\s*z:\s*([-+0-9.eE]+)",
-            out,
-        )
-        if not mpos:
-            return None
-        px = float(mpos.group(1))
-        py = float(mpos.group(2))
-        pz = float(mpos.group(3))
-
-        mori = re.search(
-            r"orientation:\s*\n\s*x:\s*([-+0-9.eE]+)\s*\n\s*y:\s*([-+0-9.eE]+)\s*\n\s*z:\s*([-+0-9.eE]+)\s*\n\s*w:\s*([-+0-9.eE]+)",
-            out,
-        )
-        if not mori:
-            yaw = 0.0
-        else:
-            yaw = _yaw_from_quat(float(mori.group(1)), float(mori.group(2)), float(mori.group(3)), float(mori.group(4)))
-        return (px, py, pz, yaw)
+        pose = _parse_odom_pose_from_text(out)
+        if pose is not None and self._odom_pose_cache is not None:
+            self._odom_pose_cache._consume_block(out.splitlines())
+        return pose
 
     def _publish_hold_for(self, seconds: float) -> None:
+        if self.control_dry_run:
+            print(f"[HOLD][DRY-RUN] skip publishing hold for {seconds:.2f}s to {self.hold_topic}")
+            return
         pose = self._read_odom_pose_once()
         if pose is None:
             return
@@ -638,11 +819,10 @@ class PlanExecutor:
                 "trajectory_id: 0, trajectory_flag: 0}"
             )
             try:
-                subprocess.run(
-                    ["rostopic", "pub", "-1", self.hold_topic, "quadrotor_msgs/PositionCommand", msg],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
+                self.ros_transport.run_shell(
+                    f"rostopic pub -1 {shlex.quote(self.hold_topic)} quadrotor_msgs/PositionCommand {shlex.quote(msg)}",
+                    timeout=6.0,
+                    capture_output=False,
                 )
             except Exception:
                 pass
@@ -1072,6 +1252,9 @@ class PlanExecutor:
         x = float(goal.get("x", 0.0))
         y = float(goal.get("y", 0.0))
         z = float(goal.get("z", 1.0))
+        if self.control_dry_run:
+            print(f"[NAVIGATE][DRY-RUN] skip PoseStamped publish to {topic}: x={x:.2f} y={y:.2f} z={z:.2f}")
+            return True
         yaw_deg = float(goal.get("yaw_deg", 0.0))
         yaw = math.radians(yaw_deg)
         qx, qy, qz, qw = _quat_from_yaw(yaw)
@@ -1081,23 +1264,19 @@ class PlanExecutor:
             'pose: {position: {x: ' + str(x) + ', y: ' + str(y) + ', z: ' + str(z) + '}, '
             'orientation: {x: ' + str(qx) + ', y: ' + str(qy) + ', z: ' + str(qz) + ', w: ' + str(qw) + '}}}'
         )
-        base_prefix = "source /opt/ros/noetic/setup.bash >/dev/null 2>&1 || true; "
-
         def _run(cmd: str) -> Tuple[int, str, str]:
             try:
-                p = subprocess.run(
-                    ["bash", "-lc", cmd],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
+                p = self.ros_transport.run_shell(
+                    cmd,
                     timeout=8.0,
+                    capture_output=True,
                 )
-                return p.returncode, p.stdout, p.stderr
+                return p.returncode, p.stdout or "", p.stderr or ""
             except subprocess.TimeoutExpired:
                 return 124, "", "command timed out"
 
         if check_topic:
-            rc, _, _ = _run(base_prefix + f"rostopic info {topic} >/dev/null 2>&1")
+            rc, _, _ = _run(f"rostopic info {shlex.quote(topic)} >/dev/null 2>&1")
             if rc != 0:
                 print(f"[NAVIGATE][WARN] rostopic info failed for {topic}, will still retry publish")
 
@@ -1105,7 +1284,7 @@ class PlanExecutor:
             time.sleep(settle_s)
 
         ok_any = False
-        pub_cmd = base_prefix + f"rostopic pub -1 {topic} geometry_msgs/PoseStamped '{msg}'"
+        pub_cmd = f"rostopic pub -1 {shlex.quote(topic)} geometry_msgs/PoseStamped {shlex.quote(msg)}"
         for i in range(max(1, int(retries))):
             try:
                 rc, _, err = _run(pub_cmd)
@@ -1313,12 +1492,35 @@ class PlanExecutor:
         return next((sid for sid, stg in self.plan.stages.items() if stg.intent == "SEARCH"), None)
 
     def _start_observe_stage(self, stage_id: str, eid: str, now: float) -> None:
+        policy = self._observe_policy(stage_id)
+        if self.control_dry_run:
+            hover_duration_s = float(policy["hover_duration_s"])
+            self._observe_state = {
+                "phase": "hovering",
+                "reason": "control_dry_run",
+                "started_t": now,
+                "start_odom_goal": None,
+                "observe_goal": None,
+                "hover_duration_s": hover_duration_s,
+                "rollback_on_fail": False,
+                "fallback_stage_id": self._observe_fallback_stage_id(stage_id),
+                "hover_until_t": now + hover_duration_s,
+                "hover_finished_t": None,
+                "rollback_started_t": None,
+                "policy": policy,
+                "verify_hit_count": 0,
+                "verify_last_det_t": None,
+                "verify_last_score": None,
+            }
+            self._record_milestone("observe_started", now, {"dry_run": True, "hover_duration_s": hover_duration_s})
+            self._emit_runtime_event("observe_started", now=now, details={"dry_run": True, "hover_duration_s": hover_duration_s})
+            return
+
         start_pose = self._read_odom_pose_once()
         if start_pose is None:
             self._observe_state = {"phase": "unavailable", "reason": "odom_unavailable", "started_t": now}
             self._emit_diag(code=DiagnosticCode.NAV_NO_GOAL, message="observe start odom unavailable", now=now, severity="error")
             return
-        policy = self._observe_policy(stage_id)
         goal = self._build_observe_goal(eid, stage_id)
         if goal is None:
             self._observe_state = {
@@ -1977,9 +2179,19 @@ class PlanExecutor:
 
     def _eval_event_safe(self, event: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         try:
-            return self.cond.eval(event, self.stage_enter_t), None
+            ok = self.cond.eval(event, self.stage_enter_t)
+            if ok and not self._event_allowed_by_stage_runtime(event):
+                return False, None
+            return ok, None
         except Exception as e:
             return False, str(e)
+
+    def _event_allowed_by_stage_runtime(self, event: Dict[str, Any]) -> bool:
+        """Prevent stale verifier state from bypassing skill-managed runtime phases."""
+        stage = self.plan.stages[self.stage_id]
+        if stage.intent == "OBSERVE" and event.get("type") == "VERIFIED":
+            return self._observe_state is not None and self._observe_state.get("phase") == "complete"
+        return True
 
     def _evaluate_stage_criteria(self, now: float) -> Dict[str, Any]:
         stage = self.plan.stages[self.stage_id]
@@ -2120,14 +2332,20 @@ class PlanExecutor:
             return False
 
         ent = self.world_state.entities.get(self.active_entity_id)
-        if ent is None or ent.last_primary_detection is None:
+        if ent is None:
             return False
 
         if force_observe_verify:
             return True
 
+        if self.semantic_trigger_always:
+            return True
+
         if criteria.get("failure_met") and self.semantic_trigger_on_failure:
             return True
+
+        if ent.last_primary_detection is None:
+            return False
 
         if self.semantic_trigger_on_ambiguous and ent.proposal_status == "multi_candidate_ambiguous":
             return True
@@ -2218,12 +2436,35 @@ class PlanExecutor:
             now=now,
             details={"skill_id": "semantic_verify", "intent": "VERIFY", "stage_id": self.stage_id},
         )
+        started_t = time.time()
         response = self.semantic_verifier.verify(request)
+        finished_t = time.time()
+        latency_s = max(0.0, finished_t - started_t)
+        prev_count = int(self._last_semantic_metrics.get("call_count") or 0)
+        prev_avg = self._last_semantic_metrics.get("avg_latency_s")
+        if prev_avg is None:
+            avg_latency_s = latency_s
+        else:
+            avg_latency_s = ((float(prev_avg) * prev_count) + latency_s) / max(1, prev_count + 1)
+        self._last_semantic_metrics = {
+            "query_type": request.query_type,
+            "latency_s": latency_s,
+            "started_t": started_t,
+            "finished_t": finished_t,
+            "call_count": prev_count + 1,
+            "avg_latency_s": avg_latency_s,
+        }
         self._last_semantic_response = response
         self._emit_runtime_event(
             "skill_stopped",
-            now=time.time(),
-            details={"skill_id": "semantic_verify", "intent": "VERIFY", "stage_id": self.stage_id},
+            now=finished_t,
+            details={
+                "skill_id": "semantic_verify",
+                "intent": "VERIFY",
+                "stage_id": self.stage_id,
+                "query_type": request.query_type,
+                "latency_s": latency_s,
+            },
         )
         self.world_state.set_stage_semantic_state(
             self.stage_id,
@@ -2232,7 +2473,23 @@ class PlanExecutor:
             last_semantic_followup=None if response.result is None else response.result.recommended_followup,
         )
         self._record_milestone("semantic_verify_called", now, {"query_type": request.query_type})
-        self._emit_runtime_event("semantic_verify_called", now=now, details={"query_type": request.query_type})
+        self._emit_runtime_event(
+            "semantic_verify_called",
+            now=now,
+            details={"query_type": request.query_type, "started_t": started_t},
+        )
+        self._emit_runtime_event(
+            "semantic_verify_finished",
+            now=finished_t,
+            details={
+                "query_type": request.query_type,
+                "latency_s": latency_s,
+                "accepted": response.accepted,
+                "reason": response.reason,
+                "call_count": self._last_semantic_metrics["call_count"],
+                "avg_latency_s": avg_latency_s,
+            },
+        )
 
         if not response.accepted or response.result is None:
             self._emit_diag(
@@ -2893,6 +3150,7 @@ class PlanExecutor:
             "semantic_verifier": None if self._last_semantic_response is None else {
                 "accepted": self._last_semantic_response.accepted,
                 "reason": self._last_semantic_response.reason,
+                "metrics": dict(self._last_semantic_metrics),
                 "result": None if self._last_semantic_response.result is None else {
                     "verify_status": self._last_semantic_response.result.verify_status,
                     "supports_primary_target": self._last_semantic_response.result.supports_primary_target,
@@ -3043,6 +3301,7 @@ class PlanExecutor:
         eid = st.primary_targets[0]
         ent = self.plan.entities[eid]
         prompt = ent.prompt or ""
+        visual_perception_enabled = str(ent.type or "").strip().lower() == "object"
         self._semantic_hold_counts[stage_id] = 0
 
         self.prompt_ctl.set_prompt(prompt)
@@ -3064,6 +3323,7 @@ class PlanExecutor:
             try:
                 extra = {"intent": st.intent, "budget": st.budget or {}, "policy": st.policy or {}}
                 extra.update(self._semantic_exploration_extra(stage_id))
+                extra["visual_perception_enabled"] = visual_perception_enabled
                 _atomic_write_json(
                     self.perception_request_path,
                     {

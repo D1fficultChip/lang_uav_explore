@@ -1,0 +1,301 @@
+{
+  "plan_id": "real-scene-gun-then-person-then-evac",
+  "compiled_at": 1775875009.0,
+  "schema_version": "0.1",
+  "instruction_raw": "  ",
+  "entities": [
+    {
+      "id": "E_gun",
+      "type": "object",
+      "name": "gun",
+      "prompt": "gun."
+    },
+    {
+      "id": "E_person",
+      "type": "object",
+      "name": "person",
+      "prompt": "person."
+    },
+    {
+      "id": "E_safe_exit",
+      "type": "location",
+      "name": "safe exit",
+      "prompt": "safe exit waypoint.",
+      "extra": {
+        "goal": {
+          "frame": "world",
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.8,
+          "yaw_deg": 0.0
+        }
+      }
+    }
+  ],
+  "relations": [],
+  "stages": [
+    {
+      "stage_id": "S1_search_gun",
+      "name": "search for gun",
+      "intent": "SEARCH",
+      "primary_targets": ["E_gun"],
+      "cue_targets": [],
+      "success_criteria": [
+        {
+          "type": "PERCEPTION_FOUND",
+          "params": {
+            "entity_id": "E_gun",
+            "k_hits": 3,
+            "min_score": 0.8
+          },
+          "description": "连续 3 次高置信度识别到枪后进入观察阶段"
+        }
+      ],
+      "failure_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 180
+          },
+          "description": "3 分钟内未完成枪搜索，则跳过枪观察并转入人员搜索"
+        }
+      ],
+      "budget": {
+        "max_time_s": 180
+      },
+      "policy": {
+        "semantic_mode": "bias",
+        "semantic_strength": 0.55,
+        "semantic_urgency": 0.35
+      }
+    },
+    {
+      "stage_id": "S2_observe_gun",
+      "name": "observe gun",
+      "intent": "OBSERVE",
+      "primary_targets": ["E_gun"],
+      "cue_targets": [],
+      "success_criteria": [
+        {
+          "type": "VERIFIED",
+          "params": {
+            "entity_id": "E_gun"
+          },
+          "description": "枪观察阶段经验证确认后，进入人员搜索"
+        }
+      ],
+      "failure_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 20
+          },
+          "description": "枪观察阶段超时"
+        }
+      ],
+      "budget": {
+        "max_time_s": 20
+      },
+      "policy": {
+        "observe_radius_m": 1.0,
+        "hover_duration_s": 3.0,
+        "observe_verify_hits_required": 3,
+        "observe_verify_min_score": 0.8,
+        "rollback_on_fail": true,
+        "fallback_stage_id": "S1_search_gun"
+      }
+    },
+    {
+      "stage_id": "S3_search_person",
+      "name": "search for person from current pose",
+      "intent": "SEARCH",
+      "primary_targets": ["E_person"],
+      "cue_targets": [],
+      "success_criteria": [
+        {
+          "type": "PERCEPTION_FOUND",
+          "params": {
+            "entity_id": "E_person",
+            "k_hits": 3,
+            "min_score": 0.8
+          },
+          "description": "连续 3 次高置信度识别到人后进入观察阶段"
+        }
+      ],
+      "failure_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 180
+          },
+          "description": "3 分钟内未完成人员搜索，则直接进入撤离阶段"
+        }
+      ],
+      "budget": {
+        "max_time_s": 180
+      },
+      "policy": {
+        "search_restart_from_current_pose": true,
+        "search_restart_yaw_mode": "inherit",
+        "search_restart_min_z_m": 1.2,
+        "search_restart_max_z_m": 1.8,
+        "semantic_mode": "bias",
+        "semantic_strength": 0.6,
+        "semantic_urgency": 0.4
+      }
+    },
+    {
+      "stage_id": "S4_observe_person",
+      "name": "observe person",
+      "intent": "OBSERVE",
+      "primary_targets": ["E_person"],
+      "cue_targets": [],
+      "success_criteria": [
+        {
+          "type": "VERIFIED",
+          "params": {
+            "entity_id": "E_person"
+          },
+          "description": "人员观察阶段经验证确认后，进入撤离阶段"
+        }
+      ],
+      "failure_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 20
+          },
+          "description": "人员观察阶段超时"
+        }
+      ],
+      "budget": {
+        "max_time_s": 20
+      },
+      "policy": {
+        "observe_radius_m": 1.0,
+        "hover_duration_s": 3.0,
+        "observe_verify_hits_required": 3,
+        "observe_verify_min_score": 0.8,
+        "rollback_on_fail": true,
+        "fallback_stage_id": "S3_search_person"
+      }
+    },
+    {
+      "stage_id": "S5_evacuate",
+      "name": "navigate to designated evacuation point",
+      "intent": "NAVIGATE",
+      "primary_targets": ["E_safe_exit"],
+      "cue_targets": [],
+      "success_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 15
+          },
+          "description": "撤离导航启动后持续执行 15 秒，当前版本以此作为撤离完成近似标志"
+        }
+      ],
+      "failure_criteria": [
+        {
+          "type": "TIMEOUT",
+          "params": {
+            "time_s": 90
+          },
+          "description": "撤离阶段超时"
+        }
+      ],
+      "budget": {
+        "max_time_s": 90
+      },
+      "policy": {}
+    }
+  ],
+  "transitions": [
+    {
+      "from": "S1_search_gun",
+      "to": "S2_observe_gun",
+      "when": {
+        "type": "PERCEPTION_FOUND",
+        "params": {
+          "entity_id": "E_gun",
+          "k_hits": 3,
+          "min_score": 0.8
+        },
+        "description": "连续 3 次高置信度检测到枪后进入枪观察阶段"
+      }
+    },
+    {
+      "from": "S1_search_gun",
+      "to": "S3_search_person",
+      "when": {
+        "type": "TIMEOUT",
+        "params": {
+          "time_s": 180
+        },
+        "description": "枪搜索预算耗尽后，直接进入人员搜索"
+      }
+    },
+    {
+      "from": "S2_observe_gun",
+      "to": "S3_search_person",
+      "when": {
+        "type": "VERIFIED",
+        "params": {
+          "entity_id": "E_gun"
+        },
+        "description": "枪观察经验证确认后，进入人员搜索"
+      }
+    },
+    {
+      "from": "S3_search_person",
+      "to": "S4_observe_person",
+      "when": {
+        "type": "PERCEPTION_FOUND",
+        "params": {
+          "entity_id": "E_person",
+          "k_hits": 3,
+          "min_score": 0.8
+        },
+        "description": "连续 3 次高置信度检测到人后进入人员观察阶段"
+      }
+    },
+    {
+      "from": "S3_search_person",
+      "to": "S5_evacuate",
+      "when": {
+        "type": "TIMEOUT",
+        "params": {
+          "time_s": 180
+        },
+        "description": "人员搜索预算耗尽后，直接进入撤离阶段"
+      }
+    },
+    {
+      "from": "S4_observe_person",
+      "to": "S5_evacuate",
+      "when": {
+        "type": "VERIFIED",
+        "params": {
+          "entity_id": "E_person"
+        },
+        "description": "人员观察经验证确认后，进入撤离阶段"
+      }
+    }
+  ],
+  "global_policy": {
+    "budget": {
+      "time_s": 600,
+      "description": "整条任务总预算 10 分钟，覆盖枪搜索、人员搜索和撤离阶段"
+    }
+  },
+  "assumptions": [
+    "真实场景中可能存在枪和人两个目标，且感知链能够分别输出它们的检测结果和世界坐标。",
+    "枪和人的 observe 阶段都依赖定位模块给出的 target_position_world。",
+    "第二段搜索从当前位姿重启，不返回初始起点。",
+    "撤离点坐标当前先使用占位默认值，后续需要替换为真实任务坐标。"
+  ],
+  "open_questions": [
+    "S5_evacuate 当前以导航阶段持续 15 秒作为撤离完成的近似判据；若后续需要严格按 goal_reached 收敛，可在中枢层补专用导航完成条件。",
+    "E_safe_exit 的默认 goal 仅为占位参数，实飞前需要替换为真实撤离点世界坐标。"
+  ]
+}

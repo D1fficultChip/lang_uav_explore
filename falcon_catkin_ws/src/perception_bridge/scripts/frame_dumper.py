@@ -7,7 +7,7 @@ import cv2
 
 class FrameDumper:
     def __init__(self):
-        self.image_topic = rospy.get_param("~image_topic", "/uav_simulator/rgb_camera/image_raw")
+        self.image_topic = rospy.get_param("~image_topic", "/camera/color/image_raw")
         # self.image_topic = rospy.get_param("~image_topic", "/camera/image_raw")
         self.out_dir = rospy.get_param("~out_dir", "/shared")
         self.rate_hz = float(rospy.get_param("~rate_hz", 5.0))

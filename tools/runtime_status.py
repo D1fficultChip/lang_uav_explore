@@ -79,6 +79,8 @@ def build_status(runtime_log: Path, event_log: Path, shared_dir: Path) -> Dict[s
     criteria = snap.get("criteria") or {}
     diagnostics = snap.get("diagnostics") or []
     escape_state = snap.get("escape_state") or {}
+    semantic_snap = snap.get("semantic_verifier") or {}
+    semantic_metrics = semantic_snap.get("metrics") or {}
 
     latest_event = events[-1] if events else {}
     recent_event_briefs = []
@@ -142,6 +144,12 @@ def build_status(runtime_log: Path, event_log: Path, shared_dir: Path) -> Dict[s
             "failure_hypothesis": entity.get("semantic_failure_hypothesis"),
             "explanation": entity.get("semantic_explanation"),
             "last_semantic_verify_t": entity.get("last_semantic_verify_t"),
+            "last_query_type": semantic_metrics.get("query_type"),
+            "last_latency_s": semantic_metrics.get("latency_s"),
+            "avg_latency_s": semantic_metrics.get("avg_latency_s"),
+            "call_count": semantic_metrics.get("call_count"),
+            "accepted": semantic_snap.get("accepted"),
+            "reason": semantic_snap.get("reason"),
         },
         "observe": {
             "phase": observe_state.get("phase"),
@@ -216,6 +224,10 @@ def print_terminal(status: Dict[str, Any]) -> None:
     print(
         f"Semantic status={sem.get('status')} conf={sem.get('confidence')} "
         f"followup={sem.get('recommended_followup')} need_view={sem.get('need_additional_view')}"
+    )
+    print(
+        f"Semantic latency last={sem.get('last_latency_s')}s avg={sem.get('avg_latency_s')}s "
+        f"calls={sem.get('call_count')} query={sem.get('last_query_type')} accepted={sem.get('accepted')}"
     )
     print("Recent events:")
     for ev in status["recent_events"][-6:]:

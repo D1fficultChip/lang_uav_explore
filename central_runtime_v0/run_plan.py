@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import yaml
+from typing import Optional
 
 from central_runtime.plan_loader import load_plan
 from central_runtime.infer_reader import InferJsonReader
@@ -37,6 +38,8 @@ from central_runtime.semantic_verifier import APISemanticVerifier, NoopSemanticV
 from central_runtime.adapters.ego_navigate import EgoNavigateAdapter
 from central_runtime.adapters.falcon_search import FalconSearchAdapter
 from central_runtime.adapters.docker_roslaunch import DockerRoslaunchAdapter
+from central_runtime.adapters.noop import NoopAdapter
+from central_runtime.adapters.transport import build_endpoint_spec, normalize_shell_prelude
 
 
 def _as_path(shared_dir: str, p: str | None, default_name: str) -> str:
@@ -66,6 +69,47 @@ def _as_cmd_list(cmd):
         s = cmd.strip()
         return s.split() if s else None
     return None
+
+
+def _as_str_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _adapter_endpoint_spec(adapter_cfg: dict, default_container: Optional[str] = None) -> Optional[str]:
+    transport = adapter_cfg.get("transport")
+    target = adapter_cfg.get("target")
+    port = adapter_cfg.get("port")
+    identity = adapter_cfg.get("identity")
+
+    if not any(v is not None for v in (transport, target, port, identity)):
+        return adapter_cfg.get("container", default_container)
+
+    return build_endpoint_spec(
+        container=adapter_cfg.get("container"),
+        transport=str(transport) if transport is not None else None,
+        target=str(target) if target is not None else None,
+        port=int(port) if port is not None else None,
+        identity=str(identity) if identity is not None else None,
+    )
+
+
+def _env_flag(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _adapter_enabled(global_enabled: bool, adapter_cfg: dict) -> bool:
+    if not global_enabled:
+        return False
+    return bool(adapter_cfg.get("enabled", True))
 
 
 def main():
@@ -106,6 +150,10 @@ def main():
     stage_settle_s = float(cfg.get("stage_settle_s", 0.5))
     verified_cfg = cfg.get("verified", {}) or {}
     mux_cfg = cfg.get("mux", {}) or {}
+    if _env_flag("CENTRAL_RUNTIME_CONTROL_DRY_RUN") is True:
+        mux_cfg["control_dry_run"] = True
+        mux_cfg.setdefault("read_odom_in_dry_run", False)
+        mux_cfg["odom_cache_enabled"] = False
 
     # --- load plan and build IO helpers ---
     plan = load_plan(args.plan, intent_alias=cfg.get("intent_alias"))
@@ -176,13 +224,18 @@ def main():
     # --- Build adapters ---
     adapters: dict[str, object] = {}
     a_cfg = cfg.get("adapters", {}) or {}
+    adapters_enabled = bool(a_cfg.get("enabled", True))
+    if _env_flag("CENTRAL_RUNTIME_DISABLE_ADAPTERS") is True:
+        adapters_enabled = False
 
     # SEARCH (FALCON)
     search_cfg = a_cfg.get("SEARCH", {}) or {}
     search_cmd = _as_cmd_list(search_cfg.get("cmd"))
-    search_container = search_cfg.get("container")  # e.g., "falcon_noetic"
+    search_container = _adapter_endpoint_spec(search_cfg)  # e.g., "falcon_noetic" or "ssh:user@host"
 
-    if search_cmd:
+    if not _adapter_enabled(adapters_enabled, search_cfg):
+        adapters["SEARCH"] = NoopAdapter("SEARCH")
+    elif search_cmd:
         if search_container:
             adapters["SEARCH"] = DockerRoslaunchAdapter(
                 container=search_container,
@@ -194,13 +247,15 @@ def main():
                     # keep reasonably specific so we don't kill unrelated roslaunch
                     "roslaunch exploration_manager exploration.launch",
                 ),
+                ssh_extra_args=_as_str_list(search_cfg.get("ssh_extra_args")),
+                shell_prelude=normalize_shell_prelude(search_cfg.get("shell_prelude")),
             )
         else:
             adapters["SEARCH"] = FalconSearchAdapter(cmd=search_cmd)
 
     # NAVIGATE (EGO)
     nav_cfg = a_cfg.get("NAVIGATE", {}) or {}
-    nav_container = nav_cfg.get("container", "ego_noetic")
+    nav_container = _adapter_endpoint_spec(nav_cfg, default_container="ego_noetic")
     nav_launch_cmd = _as_cmd_list(nav_cfg.get("cmd"))
     if not nav_launch_cmd:
         # fallback (you will set it in config)
@@ -209,55 +264,70 @@ def main():
     # IMPORTANT: make executor goal topic consistent with NAVIGATE adapter goal_topic
     goal_topic = nav_cfg.get("goal_topic", cfg.get("ego_goal_topic", "/move_base_simple/goal"))
 
-    adapters["NAVIGATE"] = EgoNavigateAdapter(
-        container=nav_container,
-        launch_cmd=nav_launch_cmd,
-        pidfile_in_shared=nav_cfg.get("pidfile", "/shared/ego_nav.pid"),
-        logfile_in_shared=nav_cfg.get("logfile", "/shared/ego_nav.log"),
-        stop_fallback_pattern=nav_cfg.get("stop_pattern", "roslaunch ego_planner"),
-        goal_topic=goal_topic,
-        goal_frame=nav_cfg.get("goal_frame", "map"),
-        goal_key=nav_cfg.get("goal_key", "goal_xyz"),
-        default_goal_xyz=nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0]),
-        publish_goal_once=bool(nav_cfg.get("publish_goal_once", False)),
-        startup_sleep_s=float(nav_cfg.get("startup_sleep_s", 0.5)),
-    )
+    if not _adapter_enabled(adapters_enabled, nav_cfg):
+        adapters["NAVIGATE"] = NoopAdapter("NAVIGATE")
+    else:
+        adapters["NAVIGATE"] = EgoNavigateAdapter(
+            container=nav_container,
+            launch_cmd=nav_launch_cmd,
+            pidfile_in_shared=nav_cfg.get("pidfile", "/shared/ego_nav.pid"),
+            logfile_in_shared=nav_cfg.get("logfile", "/shared/ego_nav.log"),
+            stop_fallback_pattern=nav_cfg.get("stop_pattern", "roslaunch ego_planner"),
+            goal_topic=goal_topic,
+            goal_frame=nav_cfg.get("goal_frame", "map"),
+            goal_key=nav_cfg.get("goal_key", "goal_xyz"),
+            default_goal_xyz=nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0]),
+            publish_goal_once=bool(nav_cfg.get("publish_goal_once", False)),
+            startup_sleep_s=float(nav_cfg.get("startup_sleep_s", 0.5)),
+            ssh_extra_args=_as_str_list(nav_cfg.get("ssh_extra_args")),
+            shell_prelude=normalize_shell_prelude(nav_cfg.get("shell_prelude")),
+        )
 
     observe_cfg = a_cfg.get("OBSERVE", {}) or {}
-    observe_container = observe_cfg.get("container", nav_container)
+    observe_container = _adapter_endpoint_spec(observe_cfg, default_container=nav_container)
     observe_launch_cmd = _as_cmd_list(observe_cfg.get("cmd")) or list(nav_launch_cmd)
     observe_goal_topic = observe_cfg.get("goal_topic", goal_topic)
-    adapters["OBSERVE"] = EgoNavigateAdapter(
-        container=observe_container,
-        launch_cmd=observe_launch_cmd,
-        pidfile_in_shared=observe_cfg.get("pidfile", nav_cfg.get("pidfile", "/shared/ego_nav.pid")),
-        logfile_in_shared=observe_cfg.get("logfile", nav_cfg.get("logfile", "/shared/ego_nav.log")),
-        stop_fallback_pattern=observe_cfg.get("stop_pattern", nav_cfg.get("stop_pattern", "roslaunch ego_planner")),
-        goal_topic=observe_goal_topic,
-        goal_frame=observe_cfg.get("goal_frame", nav_cfg.get("goal_frame", "map")),
-        goal_key=observe_cfg.get("goal_key", nav_cfg.get("goal_key", "goal_xyz")),
-        default_goal_xyz=observe_cfg.get("default_goal_xyz", nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0])),
-        publish_goal_once=bool(observe_cfg.get("publish_goal_once", False)),
-        startup_sleep_s=float(observe_cfg.get("startup_sleep_s", nav_cfg.get("startup_sleep_s", 0.5))),
-    )
+    if not _adapter_enabled(adapters_enabled, observe_cfg):
+        adapters["OBSERVE"] = NoopAdapter("OBSERVE")
+    else:
+        adapters["OBSERVE"] = EgoNavigateAdapter(
+            container=observe_container,
+            launch_cmd=observe_launch_cmd,
+            pidfile_in_shared=observe_cfg.get("pidfile", nav_cfg.get("pidfile", "/shared/ego_nav.pid")),
+            logfile_in_shared=observe_cfg.get("logfile", nav_cfg.get("logfile", "/shared/ego_nav.log")),
+            stop_fallback_pattern=observe_cfg.get("stop_pattern", nav_cfg.get("stop_pattern", "roslaunch ego_planner")),
+            goal_topic=observe_goal_topic,
+            goal_frame=observe_cfg.get("goal_frame", nav_cfg.get("goal_frame", "map")),
+            goal_key=observe_cfg.get("goal_key", nav_cfg.get("goal_key", "goal_xyz")),
+            default_goal_xyz=observe_cfg.get("default_goal_xyz", nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0])),
+            publish_goal_once=bool(observe_cfg.get("publish_goal_once", False)),
+            startup_sleep_s=float(observe_cfg.get("startup_sleep_s", nav_cfg.get("startup_sleep_s", 0.5))),
+            ssh_extra_args=_as_str_list(observe_cfg.get("ssh_extra_args", nav_cfg.get("ssh_extra_args"))),
+            shell_prelude=normalize_shell_prelude(observe_cfg.get("shell_prelude", nav_cfg.get("shell_prelude"))),
+        )
 
     track_cfg = a_cfg.get("TRACK", {}) or {}
-    track_container = track_cfg.get("container", nav_container)
+    track_container = _adapter_endpoint_spec(track_cfg, default_container=nav_container)
     track_launch_cmd = _as_cmd_list(track_cfg.get("cmd")) or list(nav_launch_cmd)
     track_goal_topic = track_cfg.get("goal_topic", goal_topic)
-    adapters["TRACK"] = EgoNavigateAdapter(
-        container=track_container,
-        launch_cmd=track_launch_cmd,
-        pidfile_in_shared=track_cfg.get("pidfile", nav_cfg.get("pidfile", "/shared/ego_nav.pid")),
-        logfile_in_shared=track_cfg.get("logfile", nav_cfg.get("logfile", "/shared/ego_nav.log")),
-        stop_fallback_pattern=track_cfg.get("stop_pattern", nav_cfg.get("stop_pattern", "roslaunch ego_planner")),
-        goal_topic=track_goal_topic,
-        goal_frame=track_cfg.get("goal_frame", nav_cfg.get("goal_frame", "map")),
-        goal_key=track_cfg.get("goal_key", nav_cfg.get("goal_key", "goal_xyz")),
-        default_goal_xyz=track_cfg.get("default_goal_xyz", nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0])),
-        publish_goal_once=bool(track_cfg.get("publish_goal_once", False)),
-        startup_sleep_s=float(track_cfg.get("startup_sleep_s", nav_cfg.get("startup_sleep_s", 0.5))),
-    )
+    if not _adapter_enabled(adapters_enabled, track_cfg):
+        adapters["TRACK"] = NoopAdapter("TRACK")
+    else:
+        adapters["TRACK"] = EgoNavigateAdapter(
+            container=track_container,
+            launch_cmd=track_launch_cmd,
+            pidfile_in_shared=track_cfg.get("pidfile", nav_cfg.get("pidfile", "/shared/ego_nav.pid")),
+            logfile_in_shared=track_cfg.get("logfile", nav_cfg.get("logfile", "/shared/ego_nav.log")),
+            stop_fallback_pattern=track_cfg.get("stop_pattern", nav_cfg.get("stop_pattern", "roslaunch ego_planner")),
+            goal_topic=track_goal_topic,
+            goal_frame=track_cfg.get("goal_frame", nav_cfg.get("goal_frame", "map")),
+            goal_key=track_cfg.get("goal_key", nav_cfg.get("goal_key", "goal_xyz")),
+            default_goal_xyz=track_cfg.get("default_goal_xyz", nav_cfg.get("default_goal_xyz", [0.0, 0.0, 1.0])),
+            publish_goal_once=bool(track_cfg.get("publish_goal_once", False)),
+            startup_sleep_s=float(track_cfg.get("startup_sleep_s", nav_cfg.get("startup_sleep_s", 0.5))),
+            ssh_extra_args=_as_str_list(track_cfg.get("ssh_extra_args", nav_cfg.get("ssh_extra_args"))),
+            shell_prelude=normalize_shell_prelude(track_cfg.get("shell_prelude", nav_cfg.get("shell_prelude"))),
+        )
 
     # --- Executor (NEW interface; no request_writer/cues_writer) ---
     ex = PlanExecutor(
@@ -299,6 +369,7 @@ def main():
 
         # mux / hover
         mux_cfg=mux_cfg,
+        ros_transport_cfg=cfg.get("ros_transport", {}) or {},
     )
     ex.run()
 
