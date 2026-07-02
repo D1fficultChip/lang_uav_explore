@@ -143,7 +143,7 @@ escape:
   min_stage_dwell_s: 8.0
   stuck_window_s: 20.0
   stuck_min_progress_m: 0.5
-  stuck_region_radius_m: 1.2
+  stuck_region_radius_m: 0.5
   min_rollback_dist_m: 1.5
   max_rollback_dist_m: 8.0
   max_escape_time_s: 12.0
@@ -159,9 +159,9 @@ escape:
 reasoner:
   enabled: false
   backend: noop
-  base_url: https://api.openai.com/v1/chat/completions
-  model: ""
-  api_key_env: OPENAI_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  model: qwen-plus
+  api_key_env: DASHSCOPE_API_KEY
   timeout_s: 20.0
   temperature: 0.1
   min_stage_dwell_s: 2.0

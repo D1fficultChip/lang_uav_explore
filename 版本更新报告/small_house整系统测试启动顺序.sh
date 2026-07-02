@@ -112,15 +112,28 @@ docker exec gsa bash -lc '
 sleep 6
 
 echo "[3/7] 启动 Gazebo + UAV 基础环境（不直接启动 FALCON）"
-docker exec falcon_noetic bash -lc '
-  source /opt/ros/noetic/setup.bash
-  source /root/catkin_ws/devel/setup.bash
-  nohup xvfb-run -a -s "-screen 0 1280x1024x24" \
-    roslaunch perception_bridge small_house_uav_base.launch \
-    gui:='"${GAZEBO_GUI}"' \
-    init_x:=4.5 init_y:=0.2 init_z:=2.0 \
-    > /shared/small_house_uav_base.log 2>&1 &
-'
+if [ "${GAZEBO_GUI}" = "true" ]; then
+  echo "  Gazebo GUI 模式（直接渲染到 DISPLAY=${DISPLAY}）"
+  docker exec -e DISPLAY="${DISPLAY}" falcon_noetic bash -lc '
+    source /opt/ros/noetic/setup.bash
+    source /root/catkin_ws/devel/setup.bash
+    nohup roslaunch perception_bridge small_house_uav_base.launch \
+      gui:=true \
+      init_x:=4.5 init_y:=0.2 init_z:=2.0 \
+      > /shared/small_house_uav_base.log 2>&1 &
+  '
+else
+  echo "  Gazebo headless 模式（xvfb 虚拟屏幕）"
+  docker exec falcon_noetic bash -lc '
+    source /opt/ros/noetic/setup.bash
+    source /root/catkin_ws/devel/setup.bash
+    nohup xvfb-run -a -s "-screen 0 1280x1024x24" \
+      roslaunch perception_bridge small_house_uav_base.launch \
+      gui:=false \
+      init_x:=4.5 init_y:=0.2 init_z:=2.0 \
+      > /shared/small_house_uav_base.log 2>&1 &
+  '
+fi
 sleep 10
 
 if [ "${START_RVIZ}" = "true" ]; then
@@ -179,6 +192,7 @@ docker run -d \
 echo "[6/7] 在 runtime_noetic 内启动 central runtime"
 docker exec runtime_noetic bash -lc '
   source /opt/ros/noetic/setup.bash
+  source /home/young/uav_demo/falcon_catkin_ws/devel/setup.bash
   cd /home/young/uav_demo/central_runtime_v0
   nohup python3 run_plan.py \
     --plan '"${PLAN_PATH}"' \

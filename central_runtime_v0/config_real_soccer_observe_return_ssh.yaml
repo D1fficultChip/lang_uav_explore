@@ -1,13 +1,10 @@
-# =========================
-# central_runtime config for small-house Docker simulation
-# =========================
-
-shared_dir: /shared
+shared_dir: /home/young/uav_demo/shared
 
 infer_json: infer.json
 infer_cue_json: infer_cue.json
 target_localization_json: target_localization.json
 prompt_txt: prompt.txt
+frame_path: frame.jpg
 
 tick_hz: 10.0
 log_jsonl_path: plan_runtime.jsonl
@@ -19,13 +16,17 @@ emit_cues_txt: true
 cues_txt: cues.txt
 
 mux:
-  select_service: /mux/select
+  select_service: /cmd_mux/select
   hold_topic: /hold/pos_cmd
-  selected_topic: /mux/selected
+  selected_topic: /cmd_mux/selected
   pre_switch_hover_s: 0.3
-  odom_topic: /uav_simulator/odometry_norm
+  odom_topic: /ekf/ekf_odom
   odom_max_age_s: 0.3
-  odom_wait_timeout_s: 2.0
+  odom_wait_timeout_s: 5.0
+  odom_cache_enabled: true
+  odom_cache_max_age_s: 0.8
+  odom_cache_restart_interval_s: 1.0
+  odom_cache_allow_oneshot_fallback: false
   intent_source:
     SEARCH: /falcon/pos_cmd
     NAVIGATE: /ego/pos_cmd
@@ -36,56 +37,79 @@ ego_goal_topic: /move_base_simple/goal
 entity_goals:
   E_safe_exit:
     frame: world
-    x: 4.5
-    y: 0.2
-    z: 1.2
+    x: 0.0
+    y: 0.0
+    z: 0.8
     yaw_deg: 0.0
+
+ssh_defaults: &ssh_defaults
+  transport: ssh
+  target: nv@10.24.16.35
+  ssh_extra_args:
+    - -o
+    - ConnectTimeout=5
+    - -o
+    - ServerAliveInterval=5
+    - -o
+    - ServerAliveCountMax=2
+
+falcon_shell: &falcon_shell
+  shell_prelude:
+    - source /opt/ros/noetic/setup.bash
+    - source /home/nv/uav_demo/src/falcon_catkin_ws/devel/setup.bash
+
+ego_shell: &ego_shell
+  shell_prelude:
+    - source /opt/ros/noetic/setup.bash
+    - source /home/nv/uav_demo/src/ego_ws/devel/setup.bash
+
+ros_control_shell: &ros_control_shell
+  shell_prelude:
+    - source /opt/ros/noetic/setup.bash
+    - export ROS_MASTER_URI=http://127.0.0.1:11311
+    - if [ -f /home/nv/uav_demo/src/falcon_catkin_ws/devel/setup.bash ]; then source /home/nv/uav_demo/src/falcon_catkin_ws/devel/setup.bash; fi
+    - if [ -f /home/nv/uav_demo/src/ego_ws/devel/setup.bash ]; then source /home/nv/uav_demo/src/ego_ws/devel/setup.bash; fi
+
+ros_transport:
+  <<: [*ssh_defaults, *ros_control_shell]
 
 adapters:
   SEARCH:
-    container: falcon_noetic
+    <<: [*ssh_defaults, *falcon_shell]
     cmd:
-      - bash
-      - -lc
-      - source /opt/ros/noetic/setup.bash && source /root/catkin_ws/devel/setup.bash && roslaunch perception_bridge small_house_falcon.launch init_x:=4.5 init_y:=0.2 init_z:=2.0
-    pidfile: /shared/falcon_search.pid
-    logfile: /shared/falcon_search.log
-    stop_pattern: roslaunch perception_bridge small_house_falcon.launch
+      - /home/nv/uav_demo/start_exploration.sh
+    pidfile: /home/nv/uav_demo/src/shared/falcon_search.pid
+    logfile: /home/nv/uav_demo/src/shared/falcon_search.log
+    stop_pattern: roslaunch exploration_manager exploration.launch
 
   NAVIGATE:
-    container: ego_noetic
+    <<: [*ssh_defaults, *ego_shell]
     cmd:
-      - bash
-      - -lc
-      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom
-    pidfile: /shared/ego_nav.pid
-    logfile: /shared/ego_nav.log
+      - /home/nv/uav_demo/start_track.sh
+    pidfile: /home/nv/uav_demo/src/shared/ego_nav.pid
+    logfile: /home/nv/uav_demo/src/shared/ego_nav.log
     stop_pattern: roslaunch ego_planner
     publish_goal_once: false
     goal_topic: /move_base_simple/goal
     startup_sleep_s: 0.5
 
   OBSERVE:
-    container: ego_noetic
+    <<: [*ssh_defaults, *ego_shell]
     cmd:
-      - bash
-      - -lc
-      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom
-    pidfile: /shared/ego_nav.pid
-    logfile: /shared/ego_nav.log
+      - /home/nv/uav_demo/start_track.sh
+    pidfile: /home/nv/uav_demo/src/shared/ego_nav.pid
+    logfile: /home/nv/uav_demo/src/shared/ego_nav.log
     stop_pattern: roslaunch ego_planner
     publish_goal_once: false
     goal_topic: /move_base_simple/goal
     startup_sleep_s: 0.5
 
   TRACK:
-    container: ego_noetic
+    <<: [*ssh_defaults, *ego_shell]
     cmd:
-      - bash
-      - -lc
-      - source /opt/ros/noetic/setup.bash && source /root/ego_ws/devel/setup.bash && roslaunch ego_planner planner_only.launch odom_topic:=/uav_simulator/odometry_norm depth_topic:=/uav_simulator/depth_camera/depth/image_raw camera_pose_topic:=/uav_simulator/camera_odom
-    pidfile: /shared/ego_nav.pid
-    logfile: /shared/ego_nav.log
+      - /home/nv/uav_demo/start_track.sh
+    pidfile: /home/nv/uav_demo/src/shared/ego_nav.pid
+    logfile: /home/nv/uav_demo/src/shared/ego_nav.log
     stop_pattern: roslaunch ego_planner
     publish_goal_once: false
     goal_topic: /move_base_simple/goal
@@ -127,12 +151,35 @@ recovery:
   hold_reobserve_s: 2.0
   allow_fallback_to_search: true
 
+escape:
+  enabled: false
+  intents: [SEARCH]
+  backend: falcon
+  odom_buffer_horizon_s: 45.0
+  odom_sample_min_dist_m: 0.8
+  odom_sample_max_interval_s: 2.0
+  min_stage_dwell_s: 8.0
+  stuck_window_s: 20.0
+  stuck_min_progress_m: 0.5
+  stuck_region_radius_m: 1.2
+  min_rollback_dist_m: 1.5
+  max_rollback_dist_m: 8.0
+  max_escape_time_s: 12.0
+  max_escape_retries: 2
+  max_escape_per_stage: 3
+  goal_retry_interval_s: 1.0
+  progress_timeout_s: 4.0
+  success_radius_m: 0.8
+  success_min_anchor_clearance_m: 1.6
+  failure_cooldown_s: 10.0
+  mux_settle_s: 0.3
+
 reasoner:
-  enabled: true
-  backend: llm_api
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
-  model: qwen-plus
-  api_key_env: DASHSCOPE_API_KEY
+  enabled: false
+  backend: noop
+  base_url: https://api.openai.com/v1/chat/completions
+  model: ""
+  api_key_env: OPENAI_API_KEY
   timeout_s: 20.0
   temperature: 0.1
   min_stage_dwell_s: 2.0
@@ -167,8 +214,9 @@ semantic_verifier:
   timeout_s: 20.0
   temperature: 0.1
   include_image: false
-  min_stage_dwell_s: 1.5
-  cooldown_s: 4.0
+  min_stage_dwell_s: 0.0
+  cooldown_s: 0.5
+  trigger_always: true
   trigger_on_ambiguous: true
   trigger_on_inconclusive: true
   trigger_on_relations: true

@@ -417,6 +417,9 @@ class PlanExecutor:
         self._last_localization: Optional[TargetLocalization] = None
         self._observe_state: Optional[Dict[str, Any]] = None
         self._track_state: Optional[Dict[str, Any]] = None
+        self._semantic_async_thread: Optional[threading.Thread] = None
+        self._semantic_async_response: Any = None
+        self._semantic_async_request: Any = None
         self._escape_state: Optional[Dict[str, Any]] = None
         self._semantic_hold_counts: Dict[str, int] = {}
         self._escape_history: List[Dict[str, Any]] = []
@@ -746,27 +749,29 @@ class PlanExecutor:
         return ordered + tail
 
     # ---------------- mux / hover helpers ----------------
-    def _mux_select(self, topic: str) -> bool:
+    def _mux_select(self, topic: str, *, retries: int = 3) -> bool:
         topic = str(topic)
         if self.control_dry_run:
             print(f"[MUX][DRY-RUN] skip select {self.mux_select_service} -> {topic}")
             return True
-        try:
-            p = self.ros_transport.run_shell(
-                f"rosservice call {shlex.quote(self.mux_select_service)} {shlex.quote(topic)}",
-                timeout=8.0,
-                capture_output=True,
-            )
-            if p.returncode != 0:
-                print(f"[MUX][WARN] select failed: {(p.stderr or '').strip()}")
+        for attempt in range(1, max(1, int(retries)) + 1):
+            try:
+                p = self.ros_transport.run_shell(
+                    f"rosservice call {shlex.quote(self.mux_select_service)} {shlex.quote(topic)}",
+                    timeout=8.0,
+                    capture_output=True,
+                )
+                if p.returncode == 0:
+                    return True
+                print(f"[MUX][WARN] select failed attempt {attempt}: {(p.stderr or '').strip()}")
+            except FileNotFoundError:
+                print("[MUX][WARN] rosservice not found. Did you source ROS on host?")
                 return False
-            return True
-        except FileNotFoundError:
-            print("[MUX][WARN] rosservice not found. Did you source ROS on host?")
-            return False
-        except Exception as e:
-            print(f"[MUX][WARN] select exception: {e}")
-            return False
+            except Exception as e:
+                print(f"[MUX][WARN] select exception: {e}")
+            if attempt < retries:
+                time.sleep(0.3)
+        return False
 
     def _read_odom_pose_once(self) -> Optional[Tuple[float, float, float, float]]:
         if self.control_dry_run and not self.read_odom_in_dry_run:
@@ -1125,6 +1130,7 @@ class PlanExecutor:
         self._nav_goal_state = None
         if success:
             self.world_state.set_stage_diag(self.stage_id, None)
+            self._last_escape_failed_t[self.stage_id] = float(now)
         else:
             self._last_escape_failed_t[self.stage_id] = float(now)
             self._emit_diag(code=DiagnosticCode.ESCAPE_FAILED, message=f"escape failed: {reason}", now=now, details={"goal": goal_pose})
@@ -1693,6 +1699,17 @@ class PlanExecutor:
         stage = self.plan.stages[self.stage_id]
         if stage.intent != "OBSERVE" or self._observe_state is None:
             return False
+        # 阶段级兜底：运行超过 budget 时，不再死等其他 phase 的超时，
+        # 直接强制回退到 fallback stage（通常是 SEARCH）
+        budget_s = float((stage.budget or {}).get("max_time_s", 0) or 0)
+        if budget_s > 0 and (now - self.stage_enter_t) >= budget_s:
+            self._emit_diag(
+                code=DiagnosticCode.STAGE_FAILURE,
+                message=f"observe stage budget exceeded ({budget_s:.0f}s), forcing rollback",
+                now=now,
+                severity="warn",
+            )
+            return self._start_observe_rollback(now, reason="stage_budget_exceeded")
         phase = self._observe_state.get("phase")
         policy = self._observe_state.get("policy") or self._observe_policy(self.stage_id)
         if phase == "unavailable":
@@ -1700,11 +1717,26 @@ class PlanExecutor:
                 return self._start_observe_rollback(now, reason=str(self._observe_state.get("reason", "unavailable")))
             return False
         if phase == "waiting_for_localization":
+            # Hold in place so the drone doesn't drift away from the last sighting.
+            if self.hold_topic and self._observe_state.get("hold_applied") != True:
+                self._mux_select(self.hold_topic)
+                self._publish_hold_for(float(policy.get("observe_settle_hold_s", 3.0)))
+                self._observe_state["hold_applied"] = True
             goal = self._build_observe_goal(self.active_entity_id, self.stage_id)
+            # Only accept a goal built from fresh localization (within the last tick).
+            # During SEARCH the drone kept moving; the old localization may be stale.
+            ent = self.world_state.entities.get(self.active_entity_id)
+            loc_age_s = 999.0
+            if ent is not None and ent.last_primary_detection is not None:
+                loc_age_s = max(0.0, now - float(ent.last_primary_detection.t_wall))
+            max_loc_age = float(policy.get("observe_max_loc_age_s", 1.5))
+            if goal is not None and loc_age_s > max_loc_age:
+                goal = None  # stale — wait for the next fresh frame
             if goal is not None:
                 self._observe_state["observe_goal"] = goal
                 self._observe_state["reason"] = None
                 ok = self._publish_navigation_goal(self.active_entity_id, goal, now, trigger=True)
+                self._observe_state.pop("hold_applied", None)
                 self._record_milestone("observe_started", now, {"goal": goal, "ok": ok})
                 self._emit_runtime_event("observe_started", now=now, details={"goal": goal, "ok": ok})
                 if ok:
@@ -1773,6 +1805,19 @@ class PlanExecutor:
                 self._observe_state["phase"] = "hovering"
                 self._observe_state["hover_until_t"] = now + float(self._observe_state.get("hover_duration_s", 2.0))
                 return True
+            # Stall detection: if EGO drops the goal (e.g. WAIT_TARGET), republish.
+            if self._nav_goal_state:
+                elapsed_since_pub = now - float(self._nav_goal_state["goal_published_t"])
+                retry_count = int(self._observe_state.get("approach_goal_retries") or 0)
+                max_retries = int(policy.get("approach_goal_max_retries", 30))
+                retry_interval = float(policy.get("approach_goal_retry_interval_s", self.nav_stall_timeout_s))
+                if elapsed_since_pub >= retry_interval and retry_count < max_retries:
+                    goal = self._observe_state.get("observe_goal")
+                    if isinstance(goal, dict):
+                        self._observe_state["approach_goal_retries"] = retry_count + 1
+                        ok = self._publish_navigation_goal(self.active_entity_id, goal, now, trigger=True)
+                        self._record_milestone("observe_goal_republished", now, {"retry": retry_count + 1, "ok": ok})
+                        self._emit_runtime_event("observe_goal_republished", now=now, details={"retry": retry_count + 1, "ok": ok})
             return True
         if phase == "hovering":
             hover_until = float(self._observe_state.get("hover_until_t") or 0.0)
@@ -1818,8 +1863,11 @@ class PlanExecutor:
                     return self._start_observe_rollback(now, reason="semantic_observe_rejected")
                 return False
             grace_until = float(self._observe_state.get("hover_verify_grace_until_t") or 0.0)
+            hard_deadline = grace_until + 8.0  # at most one extra semantic round
             if now < grace_until:
                 return True
+            if now < hard_deadline and semantic_gate is None:
+                return True  # wait for one more semantic verify to finish
             if self._observe_state.get("rollback_on_fail", True):
                 return self._start_observe_rollback(now, reason="observe_inconclusive")
             return False
@@ -2309,10 +2357,10 @@ class PlanExecutor:
     def _should_run_semantic_verifier(self, now: float, verifier_results: Dict[str, VerificationResult], criteria: Dict[str, Any]) -> bool:
         if not self.semantic_enabled:
             return False
+        stage = self.plan.stages[self.stage_id]
         stage_state = self._get_stage_state()
         if stage_state is None:
             return False
-        stage = self.plan.stages[self.stage_id]
         if (now - self.stage_enter_t) < self.semantic_min_stage_dwell_s:
             return False
         force_observe_verify = False
@@ -2431,14 +2479,42 @@ class PlanExecutor:
         if stage_state is not None:
             stage_state.pending_verify = True
 
-        self._emit_runtime_event(
-            "skill_invoked",
-            now=now,
-            details={"skill_id": "semantic_verify", "intent": "VERIFY", "stage_id": self.stage_id},
-        )
-        started_t = time.time()
-        response = self.semantic_verifier.verify(request)
-        finished_t = time.time()
+        stage = self.plan.stages[self.stage_id]
+        # ---- async path for SEARCH: fire-and-forget, process result next tick ----
+        if stage.intent == "SEARCH":
+            # Check if previous async call finished
+            if self._semantic_async_thread is not None:
+                if self._semantic_async_thread.is_alive():
+                    return False  # still waiting
+                response = self._semantic_async_response
+                started_t = self._semantic_async_started_t
+                finished_t = time.time()
+                self._semantic_async_thread = None
+                self._semantic_async_response = None
+            else:
+                # Launch new async call
+                self._semantic_async_response = None
+                self._semantic_async_started_t = time.time()
+                def _run():
+                    self._semantic_async_response = self.semantic_verifier.verify(request)
+                self._semantic_async_thread = threading.Thread(target=_run, daemon=True)
+                self._semantic_async_thread.start()
+                self._emit_runtime_event(
+                    "skill_invoked",
+                    now=now,
+                    details={"skill_id": "semantic_verify", "intent": "VERIFY", "stage_id": self.stage_id},
+                )
+                return False
+        else:
+            # ---- sync path for OBSERVE / TRACK ----
+            self._emit_runtime_event(
+                "skill_invoked",
+                now=now,
+                details={"skill_id": "semantic_verify", "intent": "VERIFY", "stage_id": self.stage_id},
+            )
+            started_t = time.time()
+            response = self.semantic_verifier.verify(request)
+            finished_t = time.time()
         latency_s = max(0.0, finished_t - started_t)
         prev_count = int(self._last_semantic_metrics.get("call_count") or 0)
         prev_avg = self._last_semantic_metrics.get("avg_latency_s")
@@ -2932,6 +3008,12 @@ class PlanExecutor:
         # the detection evidence stale and causes the second PERCEPTION_FOUND evaluation
         # to drop back to false before the transition is applied.
         if stage.intent not in ("OBSERVE", "TRACK") and fired is not None:
+            # Freeze the drone immediately so we don't lose the viewing angle
+            # while the stage transition and fresh localization happen in OBSERVE.
+            if stage.intent == "SEARCH" and fired.when.get("type") == "PERCEPTION_FOUND":
+                if self.hold_topic:
+                    self._mux_select(self.hold_topic)
+                    self._publish_hold_for(3.0)
             snap = self._build_runtime_snapshot(
                 now=now,
                 primary_det=primary_det,

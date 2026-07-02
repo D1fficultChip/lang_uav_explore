@@ -14,7 +14,7 @@ export GAZEBO_GUI="${GAZEBO_GUI:-false}"
 export START_RVIZ="${START_RVIZ:-true}"
 export PLAN_PATH="${PLAN_PATH:-/shared/plan_small_city_ambulance_blue_house_task.json}"
 export RUNTIME_CONFIG="${RUNTIME_CONFIG:-/home/young/uav_demo/central_runtime_v0/config_small_city_orchestrated.yaml}"
-export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-sk-2c70c0383c854d13a43498a6bf2bb66e}"
+export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-}"
 export http_proxy="${http_proxy:-http://172.17.0.1:7897}"
 export https_proxy="${https_proxy:-http://172.17.0.1:7897}"
 

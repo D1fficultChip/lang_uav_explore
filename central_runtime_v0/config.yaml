@@ -129,11 +129,11 @@ escape:
   mux_settle_s: 0.3
 
 reasoner:
-  enabled: false
-  backend: noop
-  base_url: https://api.openai.com/v1/chat/completions
-  model: ""
-  api_key_env: OPENAI_API_KEY
+  enabled: true
+  backend: llm_api
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  model: qwen-plus
+  api_key_env: DASHSCOPE_API_KEY
   timeout_s: 20.0
   temperature: 0.1
   min_stage_dwell_s: 2.0

@@ -252,6 +252,24 @@ void UniformGrid::positionToGridCellCenterId(const Position &pos, int &cell_id, 
   Position bbox_min = uniform_grid_[cell_id].bbox_min_;
   Position bbox_max = uniform_grid_[cell_id].bbox_max_;
 
+  if (!map_server_ || !map_server_->getTSDF()) {
+    ROS_ERROR_THROTTLE(1.0,
+                       "[UniformGrid] positionToGridCellCenterId: map server or TSDF unavailable");
+    cell_id = -1;
+    center_id = -1;
+    return;
+  }
+
+  if (cell_id >= static_cast<int>(ccl_voxels_addr_.size()) ||
+      cell_id >= static_cast<int>(ccl_free_unknown_states_and_centers_idx_.size())) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[UniformGrid] positionToGridCellCenterId: CCL buffers not ready for cell %d",
+                      cell_id);
+    cell_id = -1;
+    center_id = -1;
+    return;
+  }
+
   VoxelIndex bbox_min_idx = map_server_->getTSDF()->positionToIndex(bbox_min);
   VoxelIndex bbox_max_idx = map_server_->getTSDF()->positionToIndex(bbox_max);
 
@@ -266,6 +284,14 @@ void UniformGrid::positionToGridCellCenterId(const Position &pos, int &cell_id, 
   int addr = map_server_->getTSDF()->indexToAddress(idx_nearest + bbox_min_idx);
   const std::vector<std::pair<int, int>> &free_unknown_states_and_centers_idx =
       ccl_free_unknown_states_and_centers_idx_[cell_id];
+  if (ccl_voxels_addr_[cell_id].size() != free_unknown_states_and_centers_idx.size()) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "[UniformGrid] positionToGridCellCenterId: mismatched CCL buffers for cell %d (%zu vs %zu)",
+        cell_id, ccl_voxels_addr_[cell_id].size(), free_unknown_states_and_centers_idx.size());
+    center_id = -1;
+    return;
+  }
   for (int j = 0; j < ccl_voxels_addr_[cell_id].size(); ++j) {
     std::unordered_set<int> &voxel_addrs = ccl_voxels_addr_[cell_id][j];
     if (voxel_addrs.find(addr) != voxel_addrs.end()) {
